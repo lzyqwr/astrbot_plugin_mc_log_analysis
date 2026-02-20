@@ -1,0 +1,151 @@
+{
+  "chunk_size": {
+    "description": "Map-Reduce 分块字符数",
+    "type": "int",
+    "default": 100000
+  },
+  "map_select_provider": {
+    "description": "Map阶段使用的模型提供商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "analyze_select_provider": {
+    "description": "最终分析阶段使用的模型提供商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "render_mode": {
+    "description": "渲染模式",
+    "type": "string",
+    "options": ["html_to_image", "text_to_image"],
+    "default": "html_to_image"
+  },
+  "image_width": {
+    "description": "渲染图片宽度（像素）",
+    "type": "int",
+    "default": 640
+  },
+  "full_read_char_limit": {
+    "description": "hs_err/crash 全量读取阈值（字符）",
+    "type": "int",
+    "default": 140000
+  },
+  "total_char_limit": {
+    "description": "进入 LLM 的总字符上限",
+    "type": "int",
+    "default": 140000
+  },
+  "max_tool_calls": {
+    "description": "单次分析最大工具调用次数",
+    "type": "int",
+    "default": 6
+  },
+  "tool_timeout_sec": {
+    "description": "单次工具调用超时秒数",
+    "type": "int",
+    "default": 120
+  },
+  "tool_retry_limit": {
+    "description": "单次工具调用失败重试上限",
+    "type": "int",
+    "default": 1
+  },
+  "map_llm_timeout_sec": {
+    "description": "Map阶段单片段LLM超时秒数",
+    "type": "int",
+    "default": 120
+  },
+  "analyze_llm_timeout_sec": {
+    "description": "最终分析LLM超时秒数",
+    "type": "int",
+    "default": 240
+  },
+  "max_map_chunks": {
+    "description": "Map阶段最多送入LLM的片段数",
+    "type": "int",
+    "default": 10
+  },
+  "map_timeout_break_threshold": {
+    "description": "Map阶段LLM降级达到该次数后提前结束（超时/调用失败均计入）",
+    "type": "int",
+    "default": 2
+  },
+  "skip_final_analyze_on_map_timeout": {
+    "description": "Map阶段触发降级阈值后是否跳过最终LLM分析",
+    "type": "bool",
+    "default": true
+  },
+  "html_render_timeout_sec": {
+    "description": "HTML渲染超时秒数，超时后降级为文本发送",
+    "type": "int",
+    "default": 30
+  },
+  "file_download_timeout_sec": {
+    "description": "文件下载超时秒数",
+    "type": "int",
+    "default": 30
+  },
+  "messages": {
+    "description": "发送给用户的文案配置",
+    "type": "object",
+    "items": {
+      "accepted_notice": {
+        "description": "命中文件后立即提示",
+        "type": "string",
+        "default": "已接收文件，正在分析，请稍候。"
+      },
+      "download_failed": {
+        "description": "文件下载失败提示",
+        "type": "string",
+        "default": "日志文件下载失败，请稍后重试。"
+      },
+      "no_extractable_content": {
+        "description": "未识别到可分析内容提示",
+        "type": "string",
+        "default": "未在文件中识别到可分析的日志内容。"
+      },
+      "analyze_failed_logged": {
+        "description": "LLM 分析失败提示",
+        "type": "string",
+        "default": "日志分析失败，已记录日志，请联系管理员检查检查。"
+      },
+      "analyze_failed_retry": {
+        "description": "流程异常提示",
+        "type": "string",
+        "default": "日志分析失败，请联系管理员检查。"
+      },
+      "prompt_missing": {
+        "description": "prompt 模板缺失时提示",
+        "type": "string",
+        "default": "日志分析模板缺失，请联系管理员检查 assets 目录。"
+      },
+      "provider_not_configured": {
+        "description": "未配置 map/analyze provider 时提示",
+        "type": "string",
+        "default": "请先在插件配置中填写 map_select_provider 与 analyze_select_provider。"
+      },
+      "html_render_fallback_notice": {
+        "description": "HTML 渲染失败时附加提示",
+        "type": "string",
+        "default": "[提示] HTML 渲染失败，已降级发送原始文本。"
+      },
+      "text_render_fallback_notice": {
+        "description": "文本图渲染失败时附加提示",
+        "type": "string",
+        "default": "[提示] 渲染不可用，已降级为纯文本发送。"
+      },
+      "forward_sender_name": {
+        "description": "合并转发节点显示名称",
+        "type": "string",
+        "default": "MC日志分析"
+      },
+      "summary_template": {
+        "description": "简报模板，支持 {elapsed} {source_name} {strategy}",
+        "type": "string",
+        "default": "分析完成，耗时 {elapsed:.2f} 秒\n文件: {source_name}\n策略: {strategy}"
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+以下是 Minecraft 日志片段（第 {{idx}}/{{total}} 段）。
+请仅输出关键报错总结：优先 ERROR/WARN/Exception/Caused by。
+如果片段没有有效报错，输出 `{{mr_skip}}`。
+如果堆栈链不完整，请保留关键原文行。
+
+{{chunk}}
