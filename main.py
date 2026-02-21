@@ -101,7 +101,7 @@ TIMESTAMP_LINE_RE = re.compile(r"^\s*(\[\d{2}:\d{2}:\d{2}\]|\d{4}-\d{2}-\d{2}|\[
     "astrbot_plugin_mc_log_analysis",
     "lzyqwr",
     "Minecraft 日志分析插件",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/lzyqwr/astrbot_plugin_mc_log_analysis",
 )
 class LogAnalyzer(Star):
