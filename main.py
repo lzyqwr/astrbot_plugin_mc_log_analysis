@@ -39,34 +39,36 @@ except Exception:
 ARCHIVE_EXTS = {".zip", ".gz"}
 TEXT_EXTS = {".txt", ".log"}
 ARCHIVE_NAME_KEYS = ("错误报告", "日志", "log")
-TEXT_NAME_KEYS = ("crash", "hs_err", "latest", "debug", "fcl", "pcl")
+TEXT_NAME_KEYS = ("crash", "hs_err", "latest", "debug", "fcl", "pcl", "游戏崩溃", "日志", "log")
 
 DEFAULT_CONFIG = {
-    "chunk_size": 3000,
+    "chunk_size": 100000,
+    "global_timeout_sec": 300,
     "map_select_provider": "",
     "analyze_select_provider": "",
     "render_mode": "html_to_image",
     "image_width": 640,
     "full_read_char_limit": 140000,
-    "total_char_limit": 100000,
+    "total_char_limit": 140000,
     "max_tool_calls": 6,
-    "tool_timeout_sec": 8,
+    "tool_timeout_sec": 120,
     "tool_retry_limit": 1,
-    "map_llm_timeout_sec": 6,
-    "analyze_llm_timeout_sec": 20,
-    "max_map_chunks": 6,
+    "map_llm_timeout_sec": 120,
+    "analyze_llm_timeout_sec": 240,
+    "max_map_chunks": 10,
     "map_timeout_break_threshold": 2,
     "skip_final_analyze_on_map_timeout": True,
-    "html_render_timeout_sec": 20,
+    "html_render_timeout_sec": 30,
     "file_download_timeout_sec": 30,
     "messages": {
         "accepted_notice": "已接收文件，正在分析，请稍候。",
-        "download_failed": "日志文件下载失败，请重试。",
+        "download_failed": "日志文件下载失败，请稍后重试。",
         "no_extractable_content": "未在文件中识别到可分析的日志内容。",
-        "analyze_failed_logged": "日志分析失败，已记录日志，请查看控制台后重试。",
-        "analyze_failed_retry": "日志分析失败，请稍后重试。",
+        "analyze_failed_logged": "日志分析失败，已记录日志，请联系管理员检查检查。",
+        "analyze_failed_retry": "日志分析失败，请联系管理员检查。",
         "prompt_missing": "日志分析模板缺失，请联系管理员检查 assets 目录。",
         "provider_not_configured": "请先在插件配置中填写 map_select_provider 与 analyze_select_provider。",
+        "global_timeout": "日志分析超时，请稍后重试。",
         "html_render_fallback_notice": "[提示] HTML 渲染失败，已降级发送原始文本。",
         "text_render_fallback_notice": "[提示] 渲染不可用，已降级为纯文本发送。",
         "forward_sender_name": "MC日志分析",
@@ -121,10 +123,10 @@ class LogAnalyzer(Star):
         self.temp_root.mkdir(parents=True, exist_ok=True)
         self._register_tools()
         self._cleanup_stale_temp_dirs(hours=24)
-        logger.info("[mc_log] plugin initialized")
+        logger.info("[mc_log] 插件已初始化")
 
     async def terminate(self):
-        logger.info("[mc_log] plugin terminated")
+        logger.info("[mc_log] 插件已停止")
 
     @event_message_type(EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -132,9 +134,12 @@ class LogAnalyzer(Star):
         selected = self._pick_target_file(event)
         if not selected:
             return
+        started = time.monotonic()
+        deadline = started + float(self.cfg["global_timeout_sec"])
         if not self.prompts_ready:
             self._load_prompts()
         if not self.prompts_ready:
+            logger.error("[mc_log] 提示词模板未就绪，已终止本次分析")
             result = event.plain_result(self._msg("prompt_missing"))
             result.stop_event()
             yield result
@@ -145,7 +150,7 @@ class LogAnalyzer(Star):
         map_provider_id, analyze_provider_id = self._configured_provider_ids()
         if not map_provider_id or not analyze_provider_id:
             logger.error(
-                f"[mc_log][{run_id}] provider not configured: "
+                f"[mc_log][{run_id}] 未配置模型提供商: "
                 f"map_select_provider={map_provider_id!r}, analyze_select_provider={analyze_provider_id!r}"
             )
             result = event.plain_result(self._msg("provider_not_configured"))
@@ -156,7 +161,7 @@ class LogAnalyzer(Star):
             analyze_provider_id
         ):
             logger.error(
-                f"[mc_log][{run_id}] configured provider not found: "
+                f"[mc_log][{run_id}] 配置的模型提供商不存在: "
                 f"map={map_provider_id}, analyze={analyze_provider_id}"
             )
             result = event.plain_result(self._msg("provider_not_configured"))
@@ -168,27 +173,29 @@ class LogAnalyzer(Star):
         if accepted_notice:
             yield event.plain_result(accepted_notice)
         logger.info(
-            f"[mc_log][{run_id}] analysis start: "
+            f"[mc_log][{run_id}] 开始分析: "
             f"message_id={getattr(event.message_obj, 'message_id', '')}, "
             f"name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}, "
-            f"map_provider={map_provider_id}, analyze_provider={analyze_provider_id}"
+            f"map_provider={map_provider_id}, analyze_provider={analyze_provider_id}, "
+            f"global_timeout_sec={self.cfg['global_timeout_sec']}"
         )
         logger.info(
-            f"[mc_log] matched file message: name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}"
+            f"[mc_log] 文件命中规则: name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}"
         )
-        started = time.monotonic()
         work_dir = self._build_work_dir(event)
         work_dir.mkdir(parents=True, exist_ok=True)
         (work_dir / ".mc_log_analysis").write_text("1", encoding="utf-8")
 
         try:
+            self._ensure_not_timed_out(deadline, run_id=run_id, stage="before_download")
             t_download = time.monotonic()
-            local_file = await self._download_to_workdir(file_comp, work_dir)
+            local_file = await self._download_to_workdir(file_comp, work_dir, deadline=deadline)
             logger.info(
-                f"[mc_log][{run_id}] stage download: "
+                f"[mc_log][{run_id}] 阶段下载: "
                 f"{time.monotonic() - t_download:.2f}s, ok={bool(local_file and local_file.exists())}"
             )
             if not local_file or not local_file.exists():
+                logger.warning(f"[mc_log][{run_id}] 下载阶段失败，未获取到本地文件")
                 result = event.plain_result(self._msg("download_failed"))
                 result.stop_event()
                 yield result
@@ -202,13 +209,15 @@ class LogAnalyzer(Star):
                 event=event,
                 map_provider_id=map_provider_id,
                 run_id=run_id,
+                deadline=deadline,
             )
             logger.info(
-                f"[mc_log][{run_id}] stage extract: "
+                f"[mc_log][{run_id}] 阶段提取: "
                 f"{time.monotonic() - t_extract:.2f}s, strategy={strategy}, "
                 f"chars={len(extracted)}, skip_final={skip_final_analyze}"
             )
             if not extracted.strip():
+                logger.warning(f"[mc_log][{run_id}] 提取结果为空，无法继续分析")
                 result = event.plain_result(self._msg("no_extractable_content"))
                 result.stop_event()
                 yield result
@@ -226,13 +235,14 @@ class LogAnalyzer(Star):
                 analyze_provider_id=analyze_provider_id,
                 skip_due_to_map_timeouts=skip_final_analyze,
                 run_id=run_id,
+                deadline=deadline,
             )
             logger.info(
-                f"[mc_log][{run_id}] stage analyze: "
+                f"[mc_log][{run_id}] 阶段分析: "
                 f"{time.monotonic() - t_analyze:.2f}s, ok={bool(report_md)}"
             )
             if not report_md:
-                logger.warning("[mc_log] llm analyze returned empty result")
+                logger.warning(f"[mc_log][{run_id}] 最终分析未返回内容")
                 result = event.plain_result(self._msg("analyze_failed_logged"))
                 result.stop_event()
                 yield result
@@ -240,13 +250,17 @@ class LogAnalyzer(Star):
             report_md = self._redact_text(report_md)
 
             t_render = time.monotonic()
-            render_mode, render_payload = await self._render_report(report_md, run_id=run_id)
+            render_mode, render_payload = await self._render_report(
+                report_md,
+                run_id=run_id,
+                deadline=deadline,
+            )
             logger.info(
-                f"[mc_log][{run_id}] stage render: "
+                f"[mc_log][{run_id}] 阶段渲染: "
                 f"{time.monotonic() - t_render:.2f}s, mode={render_mode}"
             )
             elapsed = time.monotonic() - started
-            logger.info(f"[mc_log][{run_id}] total elapsed: {elapsed:.2f}s")
+            logger.info(f"[mc_log][{run_id}] 分析完成，总耗时: {elapsed:.2f}s")
 
             response = self._build_forward_response(
                 event=event,
@@ -259,8 +273,13 @@ class LogAnalyzer(Star):
             )
             response.stop_event()
             yield response
+        except TimeoutError as exc:
+            logger.warning(f"[mc_log][{run_id}] 全局超时: {exc}")
+            result = event.plain_result(self._msg("global_timeout"))
+            result.stop_event()
+            yield result
         except Exception as exc:
-            logger.error(f"[mc_log][{run_id}] handle failed: {exc}", exc_info=True)
+            logger.error(f"[mc_log][{run_id}] 处理流程异常: {exc}", exc_info=True)
             result = event.plain_result(self._msg("analyze_failed_retry"))
             result.stop_event()
             yield result
@@ -272,6 +291,7 @@ class LogAnalyzer(Star):
         for key in cfg:
             cfg[key] = self._read_conf_value(key, cfg[key])
         cfg["chunk_size"] = max(500, int(cfg["chunk_size"]))
+        cfg["global_timeout_sec"] = max(10, int(cfg.get("global_timeout_sec", 300)))
         cfg["map_select_provider"] = str(cfg.get("map_select_provider", "") or "").strip()
         cfg["analyze_select_provider"] = str(cfg.get("analyze_select_provider", "") or "").strip()
         cfg["image_width"] = max(320, int(cfg.get("image_width", 640)))
@@ -296,6 +316,18 @@ class LogAnalyzer(Star):
             cfg["render_mode"] = "html_to_image"
         cfg["messages"] = self._normalize_messages_config(cfg.get("messages"))
         return cfg
+
+    def _time_left(self, deadline: float | None) -> float:
+        if deadline is None:
+            return float("inf")
+        return deadline - time.monotonic()
+
+    def _ensure_not_timed_out(self, deadline: float | None, run_id: str = "", stage: str = ""):
+        left = self._time_left(deadline)
+        if left <= 0:
+            stage_info = f", stage={stage}" if stage else ""
+            logger.warning(f"[mc_log][{run_id}] 已达到全局超时时间{stage_info}")
+            raise TimeoutError("global timeout reached")
 
     def _read_conf_value(self, key: str, default):
         """
@@ -348,7 +380,7 @@ class LogAnalyzer(Star):
         self.prompts_ready = len(missing) == 0
         if missing:
             logger.error(
-                f"[mc_log] prompt files missing or empty: {missing}; dir: {self.prompt_dir}"
+                f"[mc_log] 提示词文件缺失或为空: {missing}; 目录: {self.prompt_dir}"
             )
 
     def _read_prompt_file(self, filename: str) -> str:
@@ -359,9 +391,9 @@ class LogAnalyzer(Star):
             text = path.read_text(encoding="utf-8").strip()
             if text:
                 return text
-            logger.warning(f"[mc_log] prompt file is empty: {path}")
+            logger.warning(f"[mc_log] 提示词文件为空: {path}")
         except Exception as exc:
-            logger.warning(f"[mc_log] read prompt failed {path}: {exc}")
+            logger.warning(f"[mc_log] 读取提示词文件失败 {path}: {exc}")
         return ""
 
     def _get_prompt(self, key: str) -> str:
@@ -417,19 +449,36 @@ class LogAnalyzer(Star):
         url = f"https://search.mcmod.cn/s?key={quote_plus(normalized)}&filter=0&page=1"
         tries = self.cfg["tool_retry_limit"] + 1
         last_error = ""
-        for _ in range(tries):
+        started = time.monotonic()
+        logger.info(f"[mc_log][tool] 调用 search_mcmod: query={normalized}, tries={tries}")
+        for i in range(tries):
             try:
                 text = await self._http_get_text(url, timeout=self.cfg["tool_timeout_sec"])
                 entries = self._parse_mcmod_search_html(text)
                 if not entries:
+                    logger.info(
+                        f"[mc_log][tool] search_mcmod 无结果: query={normalized}, "
+                        f"elapsed={time.monotonic() - started:.2f}s"
+                    )
                     return f"mcmod 未找到 `{normalized}` 的结果。"
                 lines = [f"mcmod 搜索 `{normalized}`："]
                 for idx, (title, link) in enumerate(entries[:5], start=1):
                     lines.append(f"{idx}. {title} - {link}")
+                logger.info(
+                    f"[mc_log][tool] search_mcmod 成功: query={normalized}, results={len(entries)}, "
+                    f"elapsed={time.monotonic() - started:.2f}s"
+                )
                 return "\n".join(lines)
             except Exception as exc:
                 last_error = str(exc)
+                logger.warning(
+                    f"[mc_log][tool] search_mcmod 第{i + 1}/{tries}次失败: query={normalized}, err={exc}"
+                )
                 await asyncio.sleep(0.2)
+        logger.error(
+            f"[mc_log][tool] search_mcmod 最终失败: query={normalized}, err={last_error}, "
+            f"elapsed={time.monotonic() - started:.2f}s"
+        )
         return f"mcmod 查询失败：{last_error}"
 
     async def _tool_search_minecraft_wiki(self, event: AstrMessageEvent, query: str) -> str:
@@ -443,12 +492,18 @@ class LogAnalyzer(Star):
         )
         tries = self.cfg["tool_retry_limit"] + 1
         last_error = ""
-        for _ in range(tries):
+        started = time.monotonic()
+        logger.info(f"[mc_log][tool] 调用 search_minecraft_wiki: query={normalized}, tries={tries}")
+        for i in range(tries):
             try:
                 text = await self._http_get_text(url, timeout=self.cfg["tool_timeout_sec"])
                 payload = json.loads(text)
                 rows = payload.get("query", {}).get("search", [])
                 if not rows:
+                    logger.info(
+                        f"[mc_log][tool] search_minecraft_wiki 无结果: query={normalized}, "
+                        f"elapsed={time.monotonic() - started:.2f}s"
+                    )
                     return f"Minecraft Wiki 未找到 `{normalized}` 的结果。"
                 lines = [f"Minecraft Wiki 搜索 `{normalized}`："]
                 for idx, item in enumerate(rows[:5], start=1):
@@ -458,10 +513,22 @@ class LogAnalyzer(Star):
                     lines.append(f"{idx}. {title} - {page_url}")
                     if snippet:
                         lines.append(f"   摘要: {snippet}")
+                logger.info(
+                    f"[mc_log][tool] search_minecraft_wiki 成功: query={normalized}, results={len(rows)}, "
+                    f"elapsed={time.monotonic() - started:.2f}s"
+                )
                 return "\n".join(lines)
             except Exception as exc:
                 last_error = str(exc)
+                logger.warning(
+                    f"[mc_log][tool] search_minecraft_wiki 第{i + 1}/{tries}次失败: "
+                    f"query={normalized}, err={exc}"
+                )
                 await asyncio.sleep(0.2)
+        logger.error(
+            f"[mc_log][tool] search_minecraft_wiki 最终失败: query={normalized}, err={last_error}, "
+            f"elapsed={time.monotonic() - started:.2f}s"
+        )
         return f"Minecraft Wiki 查询失败：{last_error}"
 
     async def _http_get_text(self, url: str, timeout: int) -> str:
@@ -518,7 +585,7 @@ class LogAnalyzer(Star):
             if ext in TEXT_EXTS and any(k in name for k in TEXT_NAME_KEYS):
                 return file_comp, False
         logger.debug(
-            f"[mc_log] file message received but no rule matched: "
+            f"[mc_log] 收到文件消息但未命中规则: "
             f"{[self._detect_file_name(event, f) for f in files]}"
         )
         return None
@@ -575,9 +642,19 @@ class LogAnalyzer(Star):
         msg_id = re.sub(r"[^\w\-\.]", "_", msg_id)
         return f"{msg_id}-{uuid.uuid4().hex[:6]}"
 
-    async def _download_to_workdir(self, file_comp: Comp.File, work_dir: Path) -> Path | None:
-        src = await file_comp.get_file(allow_return_url=True)
+    async def _download_to_workdir(
+        self,
+        file_comp: Comp.File,
+        work_dir: Path,
+        deadline: float | None = None,
+    ) -> Path | None:
+        self._ensure_not_timed_out(deadline, stage="download_prepare")
+        src = await asyncio.wait_for(
+            file_comp.get_file(allow_return_url=True),
+            timeout=max(0.1, self._time_left(deadline)),
+        )
         if not src:
+            logger.warning("[mc_log] 获取文件源失败：file_comp.get_file 返回空")
             return None
 
         detected_name = self._detect_file_name_dummy(file_comp)
@@ -586,23 +663,35 @@ class LogAnalyzer(Star):
 
         if str(src).startswith("http://") or str(src).startswith("https://"):
             try:
+                timeout_sec = min(
+                    float(self.cfg["file_download_timeout_sec"]),
+                    max(0.1, self._time_left(deadline)),
+                )
+                logger.info(
+                    f"[mc_log] 准备下载远程文件: url={src}, dst={dst.name}, timeout={timeout_sec:.2f}s"
+                )
                 await self._download_url_to_path(
                     url=str(src),
                     dst=dst,
-                    timeout_sec=self.cfg["file_download_timeout_sec"],
+                    timeout_sec=timeout_sec,
                 )
                 return dst if dst.exists() else None
             except Exception as exc:
-                logger.error(f"[mc_log] download file url failed: {exc}", exc_info=True)
+                if self._time_left(deadline) <= 0:
+                    raise TimeoutError("global timeout reached during download") from exc
+                logger.error(f"[mc_log] 远程文件下载失败: {exc}", exc_info=True)
                 return None
 
+        self._ensure_not_timed_out(deadline, stage="download_copy")
         src_path = Path(src)
         if not src_path.exists():
+            logger.warning(f"[mc_log] 本地文件源不存在: {src_path}")
             return None
         if not safe_name or safe_name == "upload.log":
             safe_name = re.sub(r"[^\w\-.]", "_", src_path.name or "upload.log")
             dst = work_dir / safe_name
         shutil.copy2(src_path, dst)
+        logger.info(f"[mc_log] 已复制本地文件到工作目录: src={src_path.name}, dst={dst.name}")
         return dst
 
     def _detect_file_name_dummy(self, file_comp: Comp.File) -> str:
@@ -622,7 +711,7 @@ class LogAnalyzer(Star):
                 return base
         return ""
 
-    async def _download_url_to_path(self, url: str, dst: Path, timeout_sec: int):
+    async def _download_url_to_path(self, url: str, dst: Path, timeout_sec: float):
         headers = {"User-Agent": "AstrBot-MC-Log-Analyzer/1.0"}
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
         async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as session:
@@ -642,7 +731,12 @@ class LogAnalyzer(Star):
         event: AstrMessageEvent,
         map_provider_id: str,
         run_id: str = "",
+        deadline: float | None = None,
     ) -> tuple[str, str, str, bool]:
+        self._ensure_not_timed_out(deadline, run_id=run_id, stage="extract_start")
+        logger.info(
+            f"[mc_log][{run_id}] 开始提取内容: file={local_file.name}, is_archive={is_archive}"
+        )
         if is_archive:
             return await self._extract_from_archive(
                 local_file,
@@ -650,9 +744,13 @@ class LogAnalyzer(Star):
                 event,
                 map_provider_id=map_provider_id,
                 run_id=run_id,
+                deadline=deadline,
             )
         name_lower = local_file.name.lower()
         strategy = self._strategy_from_text_name(name_lower)
+        logger.info(
+            f"[mc_log][{run_id}] 文本文件策略判定: file={local_file.name}, strategy={strategy}"
+        )
         if strategy == "A":
             kind = "hs_err" if "hs_err" in name_lower else "crash"
             content = self._strategy_a_extract(local_file, kind)
@@ -666,6 +764,7 @@ class LogAnalyzer(Star):
                 event,
                 map_provider_id=map_provider_id,
                 run_id=run_id,
+                deadline=deadline,
             )
             return content, local_file.name, strategy, skip_final_analyze
 
@@ -676,9 +775,12 @@ class LogAnalyzer(Star):
         event: AstrMessageEvent,
         map_provider_id: str,
         run_id: str = "",
+        deadline: float | None = None,
     ) -> tuple[str, str, str, bool]:
+        self._ensure_not_timed_out(deadline, run_id=run_id, stage="extract_archive_start")
         ext = archive_path.suffix.lower()
         extracted_paths: list[Path] = []
+        logger.info(f"[mc_log][{run_id}] 开始解压归档文件: file={archive_path.name}, ext={ext}")
 
         if ext == ".zip":
             extracted_paths = self._safe_extract_zip(archive_path, work_dir / "unzipped")
@@ -688,27 +790,34 @@ class LogAnalyzer(Star):
 
         if not extracted_paths:
             raise RuntimeError("archive has no extractable file")
+        logger.info(f"[mc_log][{run_id}] 解压完成: extracted_count={len(extracted_paths)}")
 
         selected = self._pick_priority_file(extracted_paths)
         if not selected:
             raise RuntimeError("archive has no matching log file")
+        logger.info(f"[mc_log][{run_id}] 归档内选中文件: {selected.name}")
 
         lower = selected.name.lower()
-        if "hs_err" in lower or "crash" in lower:
+        strategy = self._strategy_from_text_name(lower)
+        logger.info(
+            f"[mc_log][{run_id}] 归档文件策略判定: file={selected.name}, strategy={strategy}"
+        )
+        if strategy == "A":
             kind = "hs_err" if "hs_err" in lower else "crash"
             content = self._strategy_a_extract(selected, kind)
-            return content, selected.name, "A", False
-        if "debug" in lower:
+            return content, selected.name, strategy, False
+        if strategy == "B":
             content = self._strategy_b_extract(selected)
-            return content, selected.name, "B", False
+            return content, selected.name, strategy, False
 
         content, skip_final_analyze = await self._strategy_c_extract(
             selected,
             event,
             map_provider_id=map_provider_id,
             run_id=run_id,
+            deadline=deadline,
         )
-        return content, selected.name, "C", skip_final_analyze
+        return content, selected.name, strategy, skip_final_analyze
 
     def _safe_extract_zip(self, zip_path: Path, out_dir: Path) -> list[Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -775,9 +884,13 @@ class LogAnalyzer(Star):
         priority = [
             ("hs_err", "A"),
             ("crash", "A"),
-            ("latest", "C"),
+            ("游戏崩溃", "C"),
             ("debug", "B"),
-            ("log", "C"),
+            ("日志", "B"),
+            ("log", "B"),
+            ("latest", "C"),
+            ("fcl", "C"),
+            ("pcl", "C"),
         ]
         files_list = list(files)
         lowered = [(p, p.name.lower()) for p in files_list]
@@ -785,12 +898,17 @@ class LogAnalyzer(Star):
             for path, name in lowered:
                 if key in name:
                     return path
+        logger.debug(
+            f"[mc_log] 归档内未找到优先关键词文件: {[p.name for p in files_list]}"
+        )
         return None
 
     def _strategy_from_text_name(self, name_lower: str) -> str:
         if "hs_err" in name_lower or "crash" in name_lower:
             return "A"
-        if "debug" in name_lower:
+        if "游戏崩溃" in name_lower:
+            return "C"
+        if "debug" in name_lower or "日志" in name_lower or "log" in name_lower:
             return "B"
         if "latest" in name_lower or "fcl" in name_lower or "pcl" in name_lower:
             return "C"
@@ -869,7 +987,9 @@ class LogAnalyzer(Star):
         event: AstrMessageEvent,
         map_provider_id: str,
         run_id: str = "",
+        deadline: float | None = None,
     ) -> tuple[str, bool]:
+        self._ensure_not_timed_out(deadline, run_id=run_id, stage="strategy_c_start")
         content = self._read_text_with_fallback(path)
         chunks = self._smart_chunk_text(content, self.cfg["chunk_size"])
         if not chunks:
@@ -878,7 +998,7 @@ class LogAnalyzer(Star):
         selected = self._select_chunks_for_map(chunks, self.cfg["max_map_chunks"])
         if len(chunks) > len(selected):
             logger.info(
-                f"[mc_log][{run_id}] strategy C chunk cap applied: total={len(chunks)}, selected={len(selected)}"
+                f"[mc_log][{run_id}] C策略分块截断: total={len(chunks)}, selected={len(selected)}"
             )
 
         mapped_results = []
@@ -886,17 +1006,24 @@ class LogAnalyzer(Star):
         threshold = self.cfg["map_timeout_break_threshold"]
         hit_degrade_threshold = False
         for idx, chunk in selected:
+            self._ensure_not_timed_out(deadline, run_id=run_id, stage=f"map_chunk_{idx}")
             summary, llm_degraded = await self._map_chunk(
-                event, chunk, idx, len(chunks), map_provider_id, run_id=run_id
+                event,
+                chunk,
+                idx,
+                len(chunks),
+                map_provider_id,
+                run_id=run_id,
+                deadline=deadline,
             )
             if llm_degraded:
                 llm_degrade_count += 1
                 if llm_degrade_count >= threshold:
                     hit_degrade_threshold = True
                     logger.warning(
-                        f"[mc_log][{run_id}] map llm degrade threshold reached: "
+                        f"[mc_log][{run_id}] Map阶段降级达到阈值: "
                         f"count={llm_degrade_count}, threshold={threshold}; "
-                        "remaining chunks will use fast fallback"
+                        "后续分块将停止处理并走降级路径"
                     )
                     break
             if summary and summary.strip() != MR_SKIP:
@@ -906,6 +1033,7 @@ class LogAnalyzer(Star):
             hit_degrade_threshold and self.cfg["skip_final_analyze_on_map_timeout"]
         )
         if not mapped_results:
+            logger.warning(f"[mc_log][{run_id}] Map阶段无有效结果，使用启发式降级文本")
             heuristic = self._build_error_focused_text(content)
             return self._apply_total_budget(heuristic, self.cfg["total_char_limit"]), skip_final_analyze
 
@@ -975,6 +1103,7 @@ class LogAnalyzer(Star):
         total: int,
         map_provider_id: str,
         run_id: str = "",
+        deadline: float | None = None,
     ) -> tuple[str, bool]:
         if not ERROR_LINE_RE.search(chunk):
             return MR_SKIP, False
@@ -993,13 +1122,17 @@ class LogAnalyzer(Star):
             },
         )
         try:
+            timeout_sec = min(
+                float(self.cfg["map_llm_timeout_sec"]),
+                max(0.1, self._time_left(deadline)),
+            )
             llm_resp = await asyncio.wait_for(
                 self.context.llm_generate(
                     chat_provider_id=map_provider_id,
                     system_prompt=map_system,
                     prompt=prompt,
                 ),
-                timeout=self.cfg["map_llm_timeout_sec"],
+                timeout=timeout_sec,
             )
             summary = (llm_resp.completion_text or "").strip()
             if not summary:
@@ -1007,11 +1140,13 @@ class LogAnalyzer(Star):
             return summary, False
         except asyncio.TimeoutError:
             logger.warning(
-                f"[mc_log][{run_id}] map llm timeout: idx={idx}/{total}, timeout={self.cfg['map_llm_timeout_sec']}s"
+                f"[mc_log][{run_id}] Map分块LLM超时: idx={idx}/{total}, timeout={self.cfg['map_llm_timeout_sec']}s"
             )
+            if self._time_left(deadline) <= 0:
+                raise TimeoutError("global timeout reached during map")
             return self._heuristic_map(chunk), True
         except Exception as exc:
-            logger.warning(f"[mc_log][{run_id}] map llm failed: idx={idx}/{total}, err={exc}")
+            logger.warning(f"[mc_log][{run_id}] Map分块LLM失败: idx={idx}/{total}, err={exc}")
             return self._heuristic_map(chunk), True
 
     def _heuristic_map(self, chunk: str) -> str:
@@ -1102,10 +1237,11 @@ class LogAnalyzer(Star):
         analyze_provider_id: str,
         skip_due_to_map_timeouts: bool = False,
         run_id: str = "",
+        deadline: float | None = None,
     ) -> str | None:
         if skip_due_to_map_timeouts:
             logger.warning(
-                f"[mc_log][{run_id}] skip final llm analyze due to map llm degrade threshold"
+                f"[mc_log][{run_id}] 因Map阶段降级达到阈值，跳过最终LLM分析"
             )
             return None
 
@@ -1113,7 +1249,7 @@ class LogAnalyzer(Star):
         system_prompt = self._get_prompt("analyze_system")
         analyze_user_tpl = self._get_prompt("analyze_user")
         if not system_prompt or not analyze_user_tpl:
-            logger.error("[mc_log] llm analyze failed: analyze prompts missing")
+            logger.error("[mc_log] 最终分析失败：分析提示词缺失")
             return None
         user_prompt = self._render_prompt(
             analyze_user_tpl,
@@ -1124,6 +1260,10 @@ class LogAnalyzer(Star):
             },
         )
         try:
+            timeout_sec = min(
+                float(self.cfg["analyze_llm_timeout_sec"]),
+                max(0.1, self._time_left(deadline)),
+            )
             llm_resp = await asyncio.wait_for(
                 self.context.tool_loop_agent(
                     event=event,
@@ -1134,18 +1274,20 @@ class LogAnalyzer(Star):
                     max_steps=self.cfg["max_tool_calls"],
                     tool_call_timeout=self.cfg["tool_timeout_sec"],
                 ),
-                timeout=self.cfg["analyze_llm_timeout_sec"],
+                timeout=timeout_sec,
             )
             text = (llm_resp.completion_text or "").strip()
             if text:
                 return text
-            logger.error("[mc_log] llm analyze failed: empty llm response")
+            logger.error("[mc_log] 最终分析失败：LLM返回空内容")
         except asyncio.TimeoutError:
             logger.error(
-                f"[mc_log][{run_id}] llm analyze timeout: {self.cfg['analyze_llm_timeout_sec']}s"
+                f"[mc_log][{run_id}] 最终分析LLM超时: {self.cfg['analyze_llm_timeout_sec']}s"
             )
+            if self._time_left(deadline) <= 0:
+                raise TimeoutError("global timeout reached during analyze")
         except Exception as exc:
-            logger.error(f"[mc_log][{run_id}] llm analyze failed: {exc}", exc_info=True)
+            logger.error(f"[mc_log][{run_id}] 最终分析LLM异常: {exc}", exc_info=True)
         return None
 
     def _build_toolset(self, names: list[str]) -> ToolSet | None:
@@ -1157,22 +1299,33 @@ class LogAnalyzer(Star):
                 toolset.add_tool(tool)
         return toolset if len(toolset) > 0 else None
 
-    async def _render_report(self, markdown_text: str, run_id: str = "") -> tuple[str, str]:
+    async def _render_report(
+        self,
+        markdown_text: str,
+        run_id: str = "",
+        deadline: float | None = None,
+    ) -> tuple[str, str]:
         mode = self.cfg["render_mode"]
         if mode == "html_to_image":
             try:
+                timeout_sec = min(
+                    float(self.cfg["html_render_timeout_sec"]),
+                    max(0.1, self._time_left(deadline)),
+                )
                 url = await asyncio.wait_for(
                     self._render_markdown_html(markdown_text),
-                    timeout=self.cfg["html_render_timeout_sec"],
+                    timeout=timeout_sec,
                 )
                 if url:
                     return "image_url", url
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[mc_log][{run_id}] html render timeout: {self.cfg['html_render_timeout_sec']}s"
+                    f"[mc_log][{run_id}] HTML渲染超时: {self.cfg['html_render_timeout_sec']}s"
                 )
+                if self._time_left(deadline) <= 0:
+                    raise TimeoutError("global timeout reached during render")
             except Exception as exc:
-                logger.warning(f"[mc_log][{run_id}] html render failed: {exc}")
+                logger.warning(f"[mc_log][{run_id}] HTML渲染失败: {exc}")
             fallback = markdown_text + "\n\n" + self._msg("html_render_fallback_notice")
             return "text", fallback
 
@@ -1181,11 +1334,11 @@ class LogAnalyzer(Star):
                 b64 = self._render_text_image_base64(markdown_text)
                 return "image_b64", b64
             except Exception as exc:
-                logger.warning(f"[mc_log][{run_id}] text render failed: {exc}")
+                logger.warning(f"[mc_log][{run_id}] 文本转图片渲染失败: {exc}")
                 fallback = markdown_text + "\n\n" + self._msg("text_render_fallback_notice")
                 return "text", fallback
 
-        logger.warning(f"[mc_log][{run_id}] unknown render_mode: {mode}, fallback to html_to_image")
+        logger.warning(f"[mc_log][{run_id}] 未知渲染模式: {mode}，回退到HTML渲染")
         try:
             url = await asyncio.wait_for(
                 self._render_markdown_html(markdown_text),
@@ -1194,7 +1347,7 @@ class LogAnalyzer(Star):
             if url:
                 return "image_url", url
         except Exception as exc:
-            logger.warning(f"[mc_log][{run_id}] html render failed (unknown-mode fallback): {exc}")
+            logger.warning(f"[mc_log][{run_id}] 未知模式回退后 HTML渲染仍失败: {exc}")
         fallback = markdown_text + "\n\n" + self._msg("html_render_fallback_notice")
         return "text", fallback
 
@@ -1346,4 +1499,4 @@ class LogAnalyzer(Star):
             if path.exists():
                 shutil.rmtree(path, ignore_errors=True)
         except Exception:
-            logger.warning("[mc_log] failed to remove temp dir:\n" + traceback.format_exc())
+            logger.warning("[mc_log] 删除临时目录失败:\n" + traceback.format_exc())

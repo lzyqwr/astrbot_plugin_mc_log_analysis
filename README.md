@@ -39,6 +39,7 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `chunk_size` | `int` | `100000` | Map-Reduce 分块字符数 |
+| `global_timeout_sec` | `int` | `180` | 全流程超时秒数（从命中文件消息开始计时） |
 | `map_select_provider` | `string(select_provider)` | `""` | Map 阶段模型提供商（必填） |
 | `analyze_select_provider` | `string(select_provider)` | `""` | 最终分析阶段模型提供商（必填） |
 | `render_mode` | `string` | `html_to_image` | 渲染模式：`html_to_image` / `text_to_image` |
@@ -68,6 +69,7 @@
 | `messages.analyze_failed_retry` | `string` | `日志分析失败，请联系管理员检查。` | 流程异常提示 |
 | `messages.prompt_missing` | `string` | `日志分析模板缺失，请联系管理员检查 assets 目录。` | Prompt 缺失提示 |
 | `messages.provider_not_configured` | `string` | `请先在插件配置中填写 map_select_provider 与 analyze_select_provider。` | Provider 未配置提示 |
+| `messages.global_timeout` | `string` | `日志分析超时，请稍后重试。` | 全流程超时提示 |
 | `messages.html_render_fallback_notice` | `string` | `[提示] HTML 渲染失败，已降级发送原始文本。` | HTML 渲染失败附加提示 |
 | `messages.text_render_fallback_notice` | `string` | `[提示] 渲染不可用，已降级为纯文本发送。` | 文本图渲染失败附加提示 |
 | `messages.forward_sender_name` | `string` | `MC日志分析` | 合并转发节点显示名称 |

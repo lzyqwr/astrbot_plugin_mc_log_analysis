@@ -4,6 +4,11 @@
     "type": "int",
     "default": 100000
   },
+  "global_timeout_sec": {
+    "description": "全流程超时秒数（从命中文件消息开始计时）",
+    "type": "int",
+    "default": 300
+  },
   "map_select_provider": {
     "description": "Map阶段使用的模型提供商",
     "type": "string",
@@ -125,6 +130,11 @@
         "description": "未配置 map/analyze provider 时提示",
         "type": "string",
         "default": "请先在插件配置中填写 map_select_provider 与 analyze_select_provider。"
+      },
+      "global_timeout": {
+        "description": "全流程超时时提示",
+        "type": "string",
+        "default": "日志分析超时，请稍后重试。"
       },
       "html_render_fallback_notice": {
         "description": "HTML 渲染失败时附加提示",
