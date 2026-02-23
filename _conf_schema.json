@@ -57,6 +57,16 @@
     "type": "int",
     "default": 1
   },
+  "api_retry_limit": {
+    "description": "API 因服务端原因失败时的最大重试次数（429/5xx/服务过载等）",
+    "type": "int",
+    "default": 1
+  },
+  "read_archive_file_limit": {
+    "description": "最终分析阶段 read_archive_file 工具最大调用次数（每次调用只能读取一个文件）",
+    "type": "int",
+    "default": 1
+  },
   "map_llm_timeout_sec": {
     "description": "Map阶段单片段LLM超时秒数",
     "type": "int",

@@ -6,6 +6,7 @@ import gzip
 import html
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ from urllib.parse import quote_plus
 import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType, event_message_type
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.tool import FunctionTool, ToolSet
@@ -53,6 +54,8 @@ DEFAULT_CONFIG = {
     "max_tool_calls": 6,
     "tool_timeout_sec": 120,
     "tool_retry_limit": 1,
+    "api_retry_limit": 1,
+    "read_archive_file_limit": 1,
     "map_llm_timeout_sec": 120,
     "analyze_llm_timeout_sec": 240,
     "max_map_chunks": 10,
@@ -81,6 +84,8 @@ MAX_ARCHIVE_SINGLE_FILE_BYTES = 12 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_GZ_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_SECTION_LINES = 400
+MAX_ARCHIVE_TOOL_CHARS = 35000
+MAX_CODE_BLOCK_MESSAGE_CHARS = 16000
 MR_SKIP = "__MR_SKIP__"
 
 PROMPT_FILES = {
@@ -116,6 +121,11 @@ class LogAnalyzer(Star):
         self.prompts: dict[str, str] = {}
         self.prompts_ready = False
         self._tool_registered = False
+        self._active_archive_file_maps: dict[str, dict[str, Path]] = {}
+        self._active_archive_tool_calls: dict[str, int] = {}
+        self.debug_log_path = Path(get_astrbot_data_path()) / "debug.log"
+        self._debug_file_handler: logging.Handler | None = None
+        self._debug_run_lock = asyncio.Lock()
 
     async def initialize(self):
         self.cfg = self._load_config()
@@ -126,7 +136,32 @@ class LogAnalyzer(Star):
         logger.info("[mc_log] 插件已初始化")
 
     async def terminate(self):
+        self._stop_debug_capture()
         logger.info("[mc_log] 插件已停止")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("debug")
+    async def send_debug_log(self, event: AstrMessageEvent):
+        if not self.debug_log_path.exists():
+            result = event.plain_result("暂无调试日志，请先触发一次日志分析。")
+            result.stop_event()
+            yield result
+            return
+        if self.debug_log_path.stat().st_size <= 0:
+            result = event.plain_result("调试日志为空，请先触发一次日志分析。")
+            result.stop_event()
+            yield result
+            return
+
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(self.debug_log_path.stat().st_mtime))
+        result = event.chain_result(
+            [
+                Comp.Plain("这是最近一次触发的单次调试日志。"),
+                Comp.File(name=f"mc_log_debug_{stamp}.log", file=str(self.debug_log_path)),
+            ]
+        )
+        result.stop_event()
+        yield result
 
     @event_message_type(EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -134,157 +169,227 @@ class LogAnalyzer(Star):
         selected = self._pick_target_file(event)
         if not selected:
             return
-        started = time.monotonic()
-        deadline = started + float(self.cfg["global_timeout_sec"])
-        if not self.prompts_ready:
-            self._load_prompts()
-        if not self.prompts_ready:
-            logger.error("[mc_log] 提示词模板未就绪，已终止本次分析")
-            result = event.plain_result(self._msg("prompt_missing"))
-            result.stop_event()
-            yield result
-            return
 
         file_comp, is_archive = selected
         run_id = self._build_run_id(event)
-        map_provider_id, analyze_provider_id = self._configured_provider_ids()
-        if not map_provider_id or not analyze_provider_id:
-            logger.error(
-                f"[mc_log][{run_id}] 未配置模型提供商: "
-                f"map_select_provider={map_provider_id!r}, analyze_select_provider={analyze_provider_id!r}"
-            )
-            result = event.plain_result(self._msg("provider_not_configured"))
-            result.stop_event()
-            yield result
-            return
-        if not self.context.get_provider_by_id(map_provider_id) or not self.context.get_provider_by_id(
-            analyze_provider_id
-        ):
-            logger.error(
-                f"[mc_log][{run_id}] 配置的模型提供商不存在: "
-                f"map={map_provider_id}, analyze={analyze_provider_id}"
-            )
-            result = event.plain_result(self._msg("provider_not_configured"))
-            result.stop_event()
-            yield result
-            return
+        async with self._debug_run_lock:
+            self._start_debug_capture(run_id, event, self._detect_file_name(event, file_comp), is_archive)
+            started = time.monotonic()
+            deadline = started + float(self.cfg["global_timeout_sec"])
+            work_dir: Path | None = None
+            try:
+                if not self.prompts_ready:
+                    self._load_prompts()
+                if not self.prompts_ready:
+                    logger.error("[mc_log] 提示词模板未就绪，已终止本次分析")
+                    result = event.plain_result(self._msg("prompt_missing"))
+                    result.stop_event()
+                    yield result
+                    return
 
-        accepted_notice = self._msg("accepted_notice")
-        if accepted_notice:
-            yield event.plain_result(accepted_notice)
+                map_provider_id, analyze_provider_id = self._configured_provider_ids()
+                if not map_provider_id or not analyze_provider_id:
+                    logger.error(
+                        f"[mc_log][{run_id}] 未配置模型提供商: "
+                        f"map_select_provider={map_provider_id!r}, analyze_select_provider={analyze_provider_id!r}"
+                    )
+                    result = event.plain_result(self._msg("provider_not_configured"))
+                    result.stop_event()
+                    yield result
+                    return
+                if not self.context.get_provider_by_id(map_provider_id) or not self.context.get_provider_by_id(
+                    analyze_provider_id
+                ):
+                    logger.error(
+                        f"[mc_log][{run_id}] 配置的模型提供商不存在: "
+                        f"map={map_provider_id}, analyze={analyze_provider_id}"
+                    )
+                    result = event.plain_result(self._msg("provider_not_configured"))
+                    result.stop_event()
+                    yield result
+                    return
+
+                accepted_notice = self._msg("accepted_notice")
+                if accepted_notice:
+                    yield event.plain_result(accepted_notice)
+                logger.info(
+                    f"[mc_log][{run_id}] 开始分析: "
+                    f"message_id={getattr(event.message_obj, 'message_id', '')}, "
+                    f"name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}, "
+                    f"map_provider={map_provider_id}, analyze_provider={analyze_provider_id}, "
+                    f"global_timeout_sec={self.cfg['global_timeout_sec']}"
+                )
+                logger.info(
+                    f"[mc_log] 文件命中规则: name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}"
+                )
+                work_dir = self._build_work_dir(event)
+                work_dir.mkdir(parents=True, exist_ok=True)
+                (work_dir / ".mc_log_analysis").write_text("1", encoding="utf-8")
+
+                self._ensure_not_timed_out(deadline, run_id=run_id, stage="before_download")
+                t_download = time.monotonic()
+                local_file = await self._download_to_workdir(file_comp, work_dir, deadline=deadline)
+                logger.info(
+                    f"[mc_log][{run_id}] 阶段下载: "
+                    f"{time.monotonic() - t_download:.2f}s, ok={bool(local_file and local_file.exists())}"
+                )
+                if not local_file or not local_file.exists():
+                    logger.warning(f"[mc_log][{run_id}] 下载阶段失败，未获取到本地文件")
+                    result = event.plain_result(self._msg("download_failed"))
+                    result.stop_event()
+                    yield result
+                    return
+
+                t_extract = time.monotonic()
+                extracted, source_name, strategy, skip_final_analyze, archive_file_map = await self._extract_content(
+                    local_file=local_file,
+                    is_archive=is_archive,
+                    work_dir=work_dir,
+                    event=event,
+                    map_provider_id=map_provider_id,
+                    run_id=run_id,
+                    deadline=deadline,
+                )
+                logger.info(
+                    f"[mc_log][{run_id}] 阶段提取: "
+                    f"{time.monotonic() - t_extract:.2f}s, strategy={strategy}, "
+                    f"chars={len(extracted)}, skip_final={skip_final_analyze}"
+                )
+                if not extracted.strip():
+                    logger.warning(f"[mc_log][{run_id}] 提取结果为空，无法继续分析")
+                    result = event.plain_result(self._msg("no_extractable_content"))
+                    result.stop_event()
+                    yield result
+                    return
+
+                extracted = self._apply_total_budget(extracted, self.cfg["total_char_limit"])
+                extracted_for_llm = self._redact_text(extracted)
+                self._set_active_archive_file_map(event, archive_file_map)
+                available_archive_files = sorted(archive_file_map.keys())
+
+                t_analyze = time.monotonic()
+                report_md = await self._analyze_with_llm(
+                    event=event,
+                    source_name=source_name,
+                    strategy=strategy,
+                    content=extracted_for_llm,
+                    available_archive_files=available_archive_files,
+                    analyze_provider_id=analyze_provider_id,
+                    skip_due_to_map_timeouts=skip_final_analyze,
+                    run_id=run_id,
+                    deadline=deadline,
+                )
+                logger.info(
+                    f"[mc_log][{run_id}] 阶段分析: "
+                    f"{time.monotonic() - t_analyze:.2f}s, ok={bool(report_md)}"
+                )
+                if not report_md:
+                    logger.warning(f"[mc_log][{run_id}] 最终分析未返回内容")
+                    result = event.plain_result(self._msg("analyze_failed_logged"))
+                    result.stop_event()
+                    yield result
+                    return
+                report_md = self._redact_text(report_md)
+
+                t_render = time.monotonic()
+                render_mode, render_payload = await self._render_report(
+                    report_md,
+                    run_id=run_id,
+                    deadline=deadline,
+                )
+                logger.info(
+                    f"[mc_log][{run_id}] 阶段渲染: "
+                    f"{time.monotonic() - t_render:.2f}s, mode={render_mode}"
+                )
+                elapsed = time.monotonic() - started
+                logger.info(f"[mc_log][{run_id}] 分析完成，总耗时: {elapsed:.2f}s")
+
+                response = self._build_forward_response(
+                    event=event,
+                    source_name=source_name,
+                    strategy=strategy,
+                    elapsed=elapsed,
+                    render_mode=render_mode,
+                    render_payload=render_payload,
+                    report_md=report_md,
+                )
+                response.stop_event()
+                yield response
+                code_blocks_text = self._build_code_blocks_message(report_md)
+                if code_blocks_text:
+                    code_result = event.plain_result(code_blocks_text)
+                    code_result.stop_event()
+                    yield code_result
+            except TimeoutError as exc:
+                logger.warning(f"[mc_log][{run_id}] 全局超时: {exc}")
+                result = event.plain_result(self._msg("global_timeout"))
+                result.stop_event()
+                yield result
+            except Exception as exc:
+                logger.error(f"[mc_log][{run_id}] 处理流程异常: {exc}", exc_info=True)
+                result = event.plain_result(self._msg("analyze_failed_retry"))
+                result.stop_event()
+                yield result
+            finally:
+                self._clear_active_archive_file_map(event)
+                if work_dir:
+                    self._safe_remove_dir(work_dir)
+                self._stop_debug_capture()
+
+    def _start_debug_capture(
+        self,
+        run_id: str,
+        event: AstrMessageEvent,
+        file_name: str,
+        is_archive: bool,
+    ):
+        self.debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._stop_debug_capture()
+        handler = logging.FileHandler(self.debug_log_path, mode="w", encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        plugin_root = str(Path(__file__).resolve().parent).lower()
+
+        class _PluginPathFilter(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                try:
+                    pathname = str(Path(record.pathname).resolve()).lower()
+                    return pathname.startswith(plugin_root)
+                except Exception:
+                    return False
+
+        handler.addFilter(_PluginPathFilter())
+        logger.addHandler(handler)
+        self._debug_file_handler = handler
         logger.info(
-            f"[mc_log][{run_id}] 开始分析: "
+            f"[mc_log][{run_id}] 已开始写入单次调试日志: "
+            f"path={self.debug_log_path}, sender={event.get_sender_id()}, "
             f"message_id={getattr(event.message_obj, 'message_id', '')}, "
-            f"name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}, "
-            f"map_provider={map_provider_id}, analyze_provider={analyze_provider_id}, "
-            f"global_timeout_sec={self.cfg['global_timeout_sec']}"
+            f"file={file_name}, is_archive={is_archive}"
         )
-        logger.info(
-            f"[mc_log] 文件命中规则: name={self._detect_file_name(event, file_comp)}, is_archive={is_archive}"
-        )
-        work_dir = self._build_work_dir(event)
-        work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / ".mc_log_analysis").write_text("1", encoding="utf-8")
 
+    def _stop_debug_capture(self):
+        handler = self._debug_file_handler
+        if not handler:
+            return
         try:
-            self._ensure_not_timed_out(deadline, run_id=run_id, stage="before_download")
-            t_download = time.monotonic()
-            local_file = await self._download_to_workdir(file_comp, work_dir, deadline=deadline)
-            logger.info(
-                f"[mc_log][{run_id}] 阶段下载: "
-                f"{time.monotonic() - t_download:.2f}s, ok={bool(local_file and local_file.exists())}"
-            )
-            if not local_file or not local_file.exists():
-                logger.warning(f"[mc_log][{run_id}] 下载阶段失败，未获取到本地文件")
-                result = event.plain_result(self._msg("download_failed"))
-                result.stop_event()
-                yield result
-                return
-
-            t_extract = time.monotonic()
-            extracted, source_name, strategy, skip_final_analyze = await self._extract_content(
-                local_file=local_file,
-                is_archive=is_archive,
-                work_dir=work_dir,
-                event=event,
-                map_provider_id=map_provider_id,
-                run_id=run_id,
-                deadline=deadline,
-            )
-            logger.info(
-                f"[mc_log][{run_id}] 阶段提取: "
-                f"{time.monotonic() - t_extract:.2f}s, strategy={strategy}, "
-                f"chars={len(extracted)}, skip_final={skip_final_analyze}"
-            )
-            if not extracted.strip():
-                logger.warning(f"[mc_log][{run_id}] 提取结果为空，无法继续分析")
-                result = event.plain_result(self._msg("no_extractable_content"))
-                result.stop_event()
-                yield result
-                return
-
-            extracted = self._apply_total_budget(extracted, self.cfg["total_char_limit"])
-            extracted_for_llm = self._redact_text(extracted)
-
-            t_analyze = time.monotonic()
-            report_md = await self._analyze_with_llm(
-                event=event,
-                source_name=source_name,
-                strategy=strategy,
-                content=extracted_for_llm,
-                analyze_provider_id=analyze_provider_id,
-                skip_due_to_map_timeouts=skip_final_analyze,
-                run_id=run_id,
-                deadline=deadline,
-            )
-            logger.info(
-                f"[mc_log][{run_id}] 阶段分析: "
-                f"{time.monotonic() - t_analyze:.2f}s, ok={bool(report_md)}"
-            )
-            if not report_md:
-                logger.warning(f"[mc_log][{run_id}] 最终分析未返回内容")
-                result = event.plain_result(self._msg("analyze_failed_logged"))
-                result.stop_event()
-                yield result
-                return
-            report_md = self._redact_text(report_md)
-
-            t_render = time.monotonic()
-            render_mode, render_payload = await self._render_report(
-                report_md,
-                run_id=run_id,
-                deadline=deadline,
-            )
-            logger.info(
-                f"[mc_log][{run_id}] 阶段渲染: "
-                f"{time.monotonic() - t_render:.2f}s, mode={render_mode}"
-            )
-            elapsed = time.monotonic() - started
-            logger.info(f"[mc_log][{run_id}] 分析完成，总耗时: {elapsed:.2f}s")
-
-            response = self._build_forward_response(
-                event=event,
-                source_name=source_name,
-                strategy=strategy,
-                elapsed=elapsed,
-                render_mode=render_mode,
-                render_payload=render_payload,
-                report_md=report_md,
-            )
-            response.stop_event()
-            yield response
-        except TimeoutError as exc:
-            logger.warning(f"[mc_log][{run_id}] 全局超时: {exc}")
-            result = event.plain_result(self._msg("global_timeout"))
-            result.stop_event()
-            yield result
-        except Exception as exc:
-            logger.error(f"[mc_log][{run_id}] 处理流程异常: {exc}", exc_info=True)
-            result = event.plain_result(self._msg("analyze_failed_retry"))
-            result.stop_event()
-            yield result
-        finally:
-            self._safe_remove_dir(work_dir)
+            handler.flush()
+        except Exception:
+            pass
+        try:
+            logger.removeHandler(handler)
+        except Exception:
+            pass
+        try:
+            handler.close()
+        except Exception:
+            pass
+        self._debug_file_handler = None
 
     def _load_config(self) -> dict:
         cfg = dict(DEFAULT_CONFIG)
@@ -300,6 +405,8 @@ class LogAnalyzer(Star):
         cfg["max_tool_calls"] = max(1, int(cfg["max_tool_calls"]))
         cfg["tool_timeout_sec"] = max(2, int(cfg["tool_timeout_sec"]))
         cfg["tool_retry_limit"] = max(0, int(cfg["tool_retry_limit"]))
+        cfg["api_retry_limit"] = max(0, int(cfg.get("api_retry_limit", 1)))
+        cfg["read_archive_file_limit"] = max(0, int(cfg.get("read_archive_file_limit", 1)))
         cfg["map_llm_timeout_sec"] = max(3, int(cfg["map_llm_timeout_sec"]))
         cfg["analyze_llm_timeout_sec"] = max(5, int(cfg["analyze_llm_timeout_sec"]))
         cfg["max_map_chunks"] = max(1, int(cfg["max_map_chunks"]))
@@ -438,7 +545,26 @@ class LogAnalyzer(Star):
             },
             handler=self._tool_search_minecraft_wiki,
         )
-        self.context.add_llm_tools(search_mcmod_tool, search_wiki_tool)
+        read_archive_file_tool = FunctionTool(
+            name="read_archive_file",
+            description="读取当前待分析压缩包里的指定文本文件内容。请优先使用完整路径。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "压缩包内文件路径，可从可用文件列表中选择。",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "返回内容字符上限，建议 5000-35000。",
+                    },
+                },
+                "required": ["file_path"],
+            },
+            handler=self._tool_read_archive_file,
+        )
+        self.context.add_llm_tools(search_mcmod_tool, search_wiki_tool, read_archive_file_tool)
         self._tool_registered = True
 
     async def _tool_search_mcmod(self, event: AstrMessageEvent, query: str) -> str:
@@ -571,6 +697,192 @@ class LogAnalyzer(Star):
         q = re.sub(r"[^\w\-\.\+\#:\u4e00-\u9fff ]", " ", q)
         q = re.sub(r"\s+", " ", q).strip()
         return q
+
+    def _is_retryable_api_error(self, exc: Exception) -> bool:
+        if isinstance(exc, aiohttp.ClientResponseError):
+            status = int(getattr(exc, "status", 0) or 0)
+            return status == 429 or 500 <= status <= 599
+
+        text = str(exc or "").lower()
+        if not text:
+            return False
+        patterns = (
+            " 429",
+            " 500",
+            " 502",
+            " 503",
+            " 504",
+            "status code: 429",
+            "status code: 500",
+            "status code: 502",
+            "status code: 503",
+            "status code: 504",
+            "rate limit",
+            "too many requests",
+            "service unavailable",
+            "server error",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
+            "overloaded",
+            "temporarily unavailable",
+            "upstream",
+        )
+        return any(p in text for p in patterns)
+
+    async def _call_with_api_retry(
+        self,
+        call_name: str,
+        coro_factory,
+        run_id: str = "",
+        deadline: float | None = None,
+    ):
+        tries = max(1, int(self.cfg.get("api_retry_limit", 1)) + 1)
+        last_exc = None
+        for i in range(tries):
+            self._ensure_not_timed_out(deadline, run_id=run_id, stage=f"{call_name}_try_{i + 1}")
+            try:
+                return await coro_factory()
+            except Exception as exc:
+                last_exc = exc
+                is_retryable = self._is_retryable_api_error(exc)
+                if not is_retryable or i >= tries - 1:
+                    raise
+                delay = min(0.4 * (2**i), 2.0)
+                time_left = self._time_left(deadline)
+                if time_left <= 0:
+                    raise TimeoutError("global timeout reached during api retry") from exc
+                sleep_sec = min(delay, max(0.0, time_left - 0.05))
+                logger.warning(
+                    f"[mc_log][{run_id}] {call_name} 服务端异常，准备重试 "
+                    f"{i + 1}/{tries - 1}: {exc}"
+                )
+                if sleep_sec > 0:
+                    await asyncio.sleep(sleep_sec)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"{call_name} failed without exception")
+
+    async def _tool_read_archive_file(
+        self,
+        event: AstrMessageEvent,
+        file_path: str,
+        max_chars: int = MAX_ARCHIVE_TOOL_CHARS,
+    ) -> str:
+        file_map = self._get_active_archive_file_map(event)
+        if not file_map:
+            return "当前任务没有可读取的压缩包文件。"
+
+        normalized = str(file_path or "").replace("\\", "/").strip().strip("/")
+        normalized = re.sub(r"/+", "/", normalized)
+        if not normalized:
+            return "file_path 无效，请提供可用文件列表中的路径。"
+        if self._looks_like_multiple_paths(normalized):
+            return "单次调用只能索要一个文件，请仅提供一个 file_path。"
+
+        consumed, consume_msg = self._consume_archive_tool_call(event)
+        if not consumed:
+            return consume_msg
+
+        resolved_key, resolved_path, err = self._resolve_archive_file_request(file_map, normalized)
+        if not resolved_path:
+            return err
+
+        try:
+            raw = resolved_path.read_bytes()
+        except Exception as exc:
+            logger.warning(f"[mc_log][tool] 读取归档文件失败: path={resolved_path}, err={exc}")
+            return f"读取 `{resolved_key}` 失败：{exc}"
+
+        if b"\x00" in raw[:4096]:
+            return f"`{resolved_key}` 看起来是二进制文件，无法直接作为文本分析。"
+
+        limit = max(1000, min(int(max_chars or MAX_ARCHIVE_TOOL_CHARS), 80000))
+        text = self._redact_text(self._read_text_with_fallback(resolved_path))
+        if len(text) > limit:
+            text = text[:limit] + "\n...[内容已截断]..."
+        return f"归档文件 `{resolved_key}` 内容:\n{text}"
+
+    def _looks_like_multiple_paths(self, value: str) -> bool:
+        if not value:
+            return False
+        if re.search(r"[\n\r,;]", value):
+            return True
+        if re.search(r"\s+(and|以及|和)\s+", value, flags=re.IGNORECASE):
+            return True
+        return False
+
+    def _resolve_archive_file_request(
+        self,
+        file_map: dict[str, Path],
+        requested: str,
+    ) -> tuple[str, Path | None, str]:
+        if requested in file_map:
+            return requested, file_map[requested], ""
+
+        req_lower = requested.lower()
+        exact_ci = [(k, p) for k, p in file_map.items() if k.lower() == req_lower]
+        if len(exact_ci) == 1:
+            return exact_ci[0][0], exact_ci[0][1], ""
+
+        req_name = Path(requested).name.lower()
+        by_name = [(k, p) for k, p in file_map.items() if Path(k).name.lower() == req_name]
+        if len(by_name) == 1:
+            return by_name[0][0], by_name[0][1], ""
+        if len(by_name) > 1:
+            options = "\n".join(f"- {k}" for k, _ in by_name[:20])
+            return "", None, f"匹配到多个同名文件，请使用完整路径：\n{options}"
+
+        suffix = [(k, p) for k, p in file_map.items() if k.lower().endswith("/" + req_lower)]
+        if len(suffix) == 1:
+            return suffix[0][0], suffix[0][1], ""
+        if len(suffix) > 1:
+            options = "\n".join(f"- {k}" for k, _ in suffix[:20])
+            return "", None, f"匹配到多个候选文件，请使用完整路径：\n{options}"
+
+        available = "\n".join(f"- {k}" for k in list(file_map.keys())[:30])
+        return "", None, f"未找到 `{requested}`。可用文件示例：\n{available}"
+
+    def _event_context_key(self, event: AstrMessageEvent) -> str:
+        msg_id = str(getattr(event.message_obj, "message_id", "") or "").strip()
+        return msg_id if msg_id else f"obj_{id(event.message_obj)}"
+
+    def _set_active_archive_file_map(
+        self,
+        event: AstrMessageEvent,
+        archive_file_map: dict[str, Path],
+    ):
+        key = self._event_context_key(event)
+        if not key:
+            return
+        self._active_archive_file_maps[key] = dict(archive_file_map or {})
+        self._active_archive_tool_calls[key] = 0
+
+    def _get_active_archive_file_map(self, event: AstrMessageEvent) -> dict[str, Path]:
+        key = self._event_context_key(event)
+        if not key:
+            return {}
+        return self._active_archive_file_maps.get(key, {})
+
+    def _consume_archive_tool_call(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        key = self._event_context_key(event)
+        if not key:
+            return False, "会话上下文不可用，无法读取归档文件。"
+        limit = max(0, int(self.cfg.get("read_archive_file_limit", 1)))
+        if limit <= 0:
+            return False, "read_archive_file 已被配置禁用。"
+        used = int(self._active_archive_tool_calls.get(key, 0))
+        if used >= limit:
+            return False, f"read_archive_file 调用次数已达上限（{limit}）。"
+        self._active_archive_tool_calls[key] = used + 1
+        return True, ""
+
+    def _clear_active_archive_file_map(self, event: AstrMessageEvent):
+        key = self._event_context_key(event)
+        if not key:
+            return
+        self._active_archive_file_maps.pop(key, None)
+        self._active_archive_tool_calls.pop(key, None)
 
     def _pick_target_file(self, event: AstrMessageEvent):
         files = [comp for comp in event.get_messages() if isinstance(comp, Comp.File)]
@@ -732,7 +1044,7 @@ class LogAnalyzer(Star):
         map_provider_id: str,
         run_id: str = "",
         deadline: float | None = None,
-    ) -> tuple[str, str, str, bool]:
+    ) -> tuple[str, str, str, bool, dict[str, Path]]:
         self._ensure_not_timed_out(deadline, run_id=run_id, stage="extract_start")
         logger.info(
             f"[mc_log][{run_id}] 开始提取内容: file={local_file.name}, is_archive={is_archive}"
@@ -754,10 +1066,10 @@ class LogAnalyzer(Star):
         if strategy == "A":
             kind = "hs_err" if "hs_err" in name_lower else "crash"
             content = self._strategy_a_extract(local_file, kind)
-            return content, local_file.name, strategy, False
+            return content, local_file.name, strategy, False, {}
         elif strategy == "B":
             content = self._strategy_b_extract(local_file)
-            return content, local_file.name, strategy, False
+            return content, local_file.name, strategy, False, {}
         else:
             content, skip_final_analyze = await self._strategy_c_extract(
                 local_file,
@@ -766,7 +1078,7 @@ class LogAnalyzer(Star):
                 run_id=run_id,
                 deadline=deadline,
             )
-            return content, local_file.name, strategy, skip_final_analyze
+            return content, local_file.name, strategy, skip_final_analyze, {}
 
     async def _extract_from_archive(
         self,
@@ -776,21 +1088,23 @@ class LogAnalyzer(Star):
         map_provider_id: str,
         run_id: str = "",
         deadline: float | None = None,
-    ) -> tuple[str, str, str, bool]:
+    ) -> tuple[str, str, str, bool, dict[str, Path]]:
         self._ensure_not_timed_out(deadline, run_id=run_id, stage="extract_archive_start")
         ext = archive_path.suffix.lower()
         extracted_paths: list[Path] = []
+        extract_root = work_dir / ("unzipped" if ext == ".zip" else "ungz")
         logger.info(f"[mc_log][{run_id}] 开始解压归档文件: file={archive_path.name}, ext={ext}")
 
         if ext == ".zip":
-            extracted_paths = self._safe_extract_zip(archive_path, work_dir / "unzipped")
+            extracted_paths = self._safe_extract_zip(archive_path, extract_root)
         elif ext == ".gz":
-            out_path = self._safe_extract_gz(archive_path, work_dir / "ungz")
+            out_path = self._safe_extract_gz(archive_path, extract_root)
             extracted_paths = [out_path] if out_path else []
 
         if not extracted_paths:
             raise RuntimeError("archive has no extractable file")
         logger.info(f"[mc_log][{run_id}] 解压完成: extracted_count={len(extracted_paths)}")
+        archive_file_map = self._build_archive_file_map(extracted_paths, extract_root)
 
         selected = self._pick_priority_file(extracted_paths)
         if not selected:
@@ -805,10 +1119,10 @@ class LogAnalyzer(Star):
         if strategy == "A":
             kind = "hs_err" if "hs_err" in lower else "crash"
             content = self._strategy_a_extract(selected, kind)
-            return content, selected.name, strategy, False
+            return content, selected.name, strategy, False, archive_file_map
         if strategy == "B":
             content = self._strategy_b_extract(selected)
-            return content, selected.name, strategy, False
+            return content, selected.name, strategy, False, archive_file_map
 
         content, skip_final_analyze = await self._strategy_c_extract(
             selected,
@@ -817,7 +1131,31 @@ class LogAnalyzer(Star):
             run_id=run_id,
             deadline=deadline,
         )
-        return content, selected.name, strategy, skip_final_analyze
+        return content, selected.name, strategy, skip_final_analyze, archive_file_map
+
+    def _build_archive_file_map(self, files: Iterable[Path], root_dir: Path) -> dict[str, Path]:
+        root = root_dir.resolve()
+        mapped: dict[str, Path] = {}
+        for path in files:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            try:
+                display = str(resolved.relative_to(root)).replace("\\", "/")
+            except Exception:
+                display = path.name
+            if not display:
+                display = path.name
+            if display in mapped:
+                suffix = 2
+                new_name = f"{display} [{suffix}]"
+                while new_name in mapped:
+                    suffix += 1
+                    new_name = f"{display} [{suffix}]"
+                display = new_name
+            mapped[display] = resolved
+        return mapped
 
     def _safe_extract_zip(self, zip_path: Path, out_dir: Path) -> list[Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1127,10 +1465,15 @@ class LogAnalyzer(Star):
                 max(0.1, self._time_left(deadline)),
             )
             llm_resp = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=map_provider_id,
-                    system_prompt=map_system,
-                    prompt=prompt,
+                self._call_with_api_retry(
+                    call_name=f"map_llm_generate[{idx}/{total}]",
+                    run_id=run_id,
+                    deadline=deadline,
+                    coro_factory=lambda: self.context.llm_generate(
+                        chat_provider_id=map_provider_id,
+                        system_prompt=map_system,
+                        prompt=prompt,
+                    ),
                 ),
                 timeout=timeout_sec,
             )
@@ -1234,6 +1577,7 @@ class LogAnalyzer(Star):
         source_name: str,
         strategy: str,
         content: str,
+        available_archive_files: list[str] | None,
         analyze_provider_id: str,
         skip_due_to_map_timeouts: bool = False,
         run_id: str = "",
@@ -1245,7 +1589,9 @@ class LogAnalyzer(Star):
             )
             return None
 
-        toolset = self._build_toolset(["search_mcmod", "search_minecraft_wiki"])
+        toolset = self._build_toolset(
+            ["search_mcmod", "search_minecraft_wiki", "read_archive_file"]
+        )
         system_prompt = self._get_prompt("analyze_system")
         analyze_user_tpl = self._get_prompt("analyze_user")
         if not system_prompt or not analyze_user_tpl:
@@ -1257,7 +1603,13 @@ class LogAnalyzer(Star):
                 "source_name": source_name,
                 "strategy": strategy,
                 "content": content,
+                "available_files": "\n".join(available_archive_files or []),
             },
+        )
+        user_prompt = (
+            user_prompt
+            + "\n\n"
+            + self._build_available_files_prompt_block(available_archive_files or [])
         )
         try:
             timeout_sec = min(
@@ -1265,14 +1617,19 @@ class LogAnalyzer(Star):
                 max(0.1, self._time_left(deadline)),
             )
             llm_resp = await asyncio.wait_for(
-                self.context.tool_loop_agent(
-                    event=event,
-                    chat_provider_id=analyze_provider_id,
-                    system_prompt=system_prompt,
-                    prompt=user_prompt,
-                    tools=toolset,
-                    max_steps=self.cfg["max_tool_calls"],
-                    tool_call_timeout=self.cfg["tool_timeout_sec"],
+                self._call_with_api_retry(
+                    call_name="analyze_tool_loop_agent",
+                    run_id=run_id,
+                    deadline=deadline,
+                    coro_factory=lambda: self.context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=analyze_provider_id,
+                        system_prompt=system_prompt,
+                        prompt=user_prompt,
+                        tools=toolset,
+                        max_steps=self.cfg["max_tool_calls"],
+                        tool_call_timeout=self.cfg["tool_timeout_sec"],
+                    ),
                 ),
                 timeout=timeout_sec,
             )
@@ -1289,6 +1646,61 @@ class LogAnalyzer(Star):
         except Exception as exc:
             logger.error(f"[mc_log][{run_id}] 最终分析LLM异常: {exc}", exc_info=True)
         return None
+
+    def _build_available_files_prompt_block(self, files: list[str]) -> str:
+        limit = max(0, int(self.cfg.get("read_archive_file_limit", 1)))
+        if not files:
+            return (
+                "【可用归档文件列表】\n"
+                "当前任务无可读取的压缩包文件；不要调用 `read_archive_file`。"
+            )
+        clipped = files[:120]
+        lines = [f"- {name}" for name in clipped]
+        if len(files) > len(clipped):
+            lines.append(f"- ...(其余 {len(files) - len(clipped)} 个文件已省略)")
+        return (
+            "【可用归档文件列表】\n"
+            f"如需补充证据，可调用工具 `read_archive_file(file_path, max_chars)`；"
+            f"本次最多可调用 {limit} 次，且单次只能读取 1 个文件。\n"
+            + "\n".join(lines)
+        )
+
+    def _build_code_blocks_message(self, markdown_text: str) -> str:
+        blocks = self._extract_fenced_code_blocks(markdown_text)
+        if not blocks:
+            return ""
+
+        parts = ["以下是分析结果中的代码块（便于复制）："]
+        remaining = MAX_CODE_BLOCK_MESSAGE_CHARS - len(parts[0]) - 2
+        for idx, (lang, code) in enumerate(blocks, start=1):
+            fence_lang = lang or "text"
+            snippet = f"\n\n[代码块 {idx}]\n```{fence_lang}\n{code}\n```"
+            if len(snippet) <= remaining:
+                parts.append(snippet)
+                remaining -= len(snippet)
+                continue
+            if remaining <= 80:
+                break
+            max_code_len = max(40, remaining - len(f"\n\n[代码块 {idx}]\n```{fence_lang}\n\n```") - 20)
+            clipped = code[:max_code_len] + "\n...[代码块内容已截断]..."
+            parts.append(f"\n\n[代码块 {idx}]\n```{fence_lang}\n{clipped}\n```")
+            remaining = 0
+            break
+
+        return "".join(parts)
+
+    def _extract_fenced_code_blocks(self, markdown_text: str) -> list[tuple[str, str]]:
+        if not markdown_text:
+            return []
+        pattern = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+        out: list[tuple[str, str]] = []
+        for match in pattern.finditer(markdown_text):
+            lang = (match.group(1) or "").strip()
+            code = (match.group(2) or "").strip("\n")
+            if not code.strip():
+                continue
+            out.append((lang, code))
+        return out
 
     def _build_toolset(self, names: list[str]) -> ToolSet | None:
         manager = self.context.get_llm_tool_manager()
