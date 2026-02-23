@@ -86,6 +86,7 @@ MAX_GZ_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_SECTION_LINES = 400
 MAX_ARCHIVE_TOOL_CHARS = 35000
 MAX_CODE_BLOCK_MESSAGE_CHARS = 16000
+MAX_DEBUG_PREVIEW_CHARS = 500
 MR_SKIP = "__MR_SKIP__"
 
 PROMPT_FILES = {
@@ -353,24 +354,21 @@ class LogAnalyzer(Star):
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
         )
-        plugin_root = str(Path(__file__).resolve().parent).lower()
-
-        class _PluginPathFilter(logging.Filter):
-            def filter(self, record: logging.LogRecord) -> bool:
-                try:
-                    pathname = str(Path(record.pathname).resolve()).lower()
-                    return pathname.startswith(plugin_root)
-                except Exception:
-                    return False
-
-        handler.addFilter(_PluginPathFilter())
         logger.addHandler(handler)
         self._debug_file_handler = handler
+        raw_message_preview = self._preview_text(getattr(event, "message_str", ""))
         logger.info(
             f"[mc_log][{run_id}] 已开始写入单次调试日志: "
             f"path={self.debug_log_path}, sender={event.get_sender_id()}, "
             f"message_id={getattr(event.message_obj, 'message_id', '')}, "
             f"file={file_name}, is_archive={is_archive}"
+        )
+        logger.info(f"[mc_log][{run_id}] 运行配置快照: {json.dumps(self.cfg, ensure_ascii=False)}")
+        logger.info(
+            f"[mc_log][{run_id}] 事件快照: platform={event.get_platform_name()}, "
+            f"sender_name={event.get_sender_name()}, sender_id={event.get_sender_id()}, "
+            f"group_id={event.get_group_id()}, session_id={event.get_session_id()}, "
+            f"message_preview={raw_message_preview}"
         )
 
     def _stop_debug_capture(self):
@@ -470,6 +468,14 @@ class LogAnalyzer(Star):
                 return value
         return str(DEFAULT_CONFIG["messages"].get(key, ""))
 
+    def _preview_text(self, text: str, limit: int = MAX_DEBUG_PREVIEW_CHARS) -> str:
+        if text is None:
+            return ""
+        s = str(text).replace("\r", " ").replace("\n", "\\n")
+        if len(s) <= limit:
+            return s
+        return s[:limit] + "...[truncated]"
+
     def _configured_provider_ids(self) -> tuple[str, str]:
         map_provider = str(self.cfg.get("map_select_provider", "") or "").strip()
         analyze_provider = str(self.cfg.get("analyze_select_provider", "") or "").strip()
@@ -485,6 +491,11 @@ class LogAnalyzer(Star):
                 missing.append(filename)
             self.prompts[key] = content
         self.prompts_ready = len(missing) == 0
+        sizes = {k: len(v or "") for k, v in self.prompts.items()}
+        logger.info(
+            f"[mc_log] 提示词加载结果: ready={self.prompts_ready}, "
+            f"sizes={sizes}"
+        )
         if missing:
             logger.error(
                 f"[mc_log] 提示词文件缺失或为空: {missing}; 目录: {self.prompt_dir}"
@@ -566,6 +577,7 @@ class LogAnalyzer(Star):
         )
         self.context.add_llm_tools(search_mcmod_tool, search_wiki_tool, read_archive_file_tool)
         self._tool_registered = True
+        logger.info("[mc_log] 工具已注册: search_mcmod, search_minecraft_wiki, read_archive_file")
 
     async def _tool_search_mcmod(self, event: AstrMessageEvent, query: str) -> str:
         normalized = self._normalize_tool_query(query)
@@ -736,13 +748,32 @@ class LogAnalyzer(Star):
         coro_factory,
         run_id: str = "",
         deadline: float | None = None,
+        response_validator=None,
     ):
         tries = max(1, int(self.cfg.get("api_retry_limit", 1)) + 1)
         last_exc = None
         for i in range(tries):
             self._ensure_not_timed_out(deadline, run_id=run_id, stage=f"{call_name}_try_{i + 1}")
             try:
-                return await coro_factory()
+                resp = await coro_factory()
+                if response_validator:
+                    ok, reason = response_validator(resp)
+                    if not ok:
+                        if i >= tries - 1:
+                            raise RuntimeError(f"{call_name} invalid response: {reason}")
+                        delay = min(0.4 * (2**i), 2.0)
+                        time_left = self._time_left(deadline)
+                        if time_left <= 0:
+                            raise TimeoutError("global timeout reached during api retry")
+                        sleep_sec = min(delay, max(0.0, time_left - 0.05))
+                        logger.warning(
+                            f"[mc_log][{run_id}] {call_name} 返回空内容，准备重试 "
+                            f"{i + 1}/{tries - 1}: {reason}"
+                        )
+                        if sleep_sec > 0:
+                            await asyncio.sleep(sleep_sec)
+                        continue
+                return resp
             except Exception as exc:
                 last_exc = exc
                 is_retryable = self._is_retryable_api_error(exc)
@@ -763,12 +794,80 @@ class LogAnalyzer(Star):
             raise last_exc
         raise RuntimeError(f"{call_name} failed without exception")
 
+    def _extract_llm_text_with_diag(self, llm_resp) -> tuple[str, dict]:
+        text = str(getattr(llm_resp, "completion_text", "") or "").strip()
+        diag = {
+            "resp_type": type(llm_resp).__name__,
+            "completion_len": len(text),
+        }
+
+        candidates = getattr(llm_resp, "candidates", None)
+        if isinstance(candidates, list):
+            diag["candidate_count"] = len(candidates)
+            fallback_parts: list[str] = []
+            for cand in candidates[:4]:
+                content = cand.get("content") if isinstance(cand, dict) else getattr(cand, "content", None)
+                parts = content.get("parts") if isinstance(content, dict) else getattr(content, "parts", None)
+                if isinstance(parts, list):
+                    for part in parts:
+                        if isinstance(part, str):
+                            part_text = part
+                        elif isinstance(part, dict):
+                            part_text = str(part.get("text") or part.get("content") or "")
+                        else:
+                            part_text = str(getattr(part, "text", "") or getattr(part, "content", "") or "")
+                        if part_text.strip():
+                            fallback_parts.append(part_text.strip())
+                content_text = content.get("text") if isinstance(content, dict) else getattr(content, "text", "")
+                if isinstance(content_text, str) and content_text.strip():
+                    fallback_parts.append(content_text.strip())
+                cand_text = cand.get("text") if isinstance(cand, dict) else getattr(cand, "text", "")
+                if isinstance(cand_text, str) and cand_text.strip():
+                    fallback_parts.append(cand_text.strip())
+            merged = "\n".join(fallback_parts).strip()
+            diag["candidates_fallback_len"] = len(merged)
+            if not text and merged:
+                text = merged
+            first = candidates[0] if candidates else None
+            if first is not None:
+                diag["candidate_finish_reason"] = (
+                    first.get("finish_reason") if isinstance(first, dict) else getattr(first, "finish_reason", None)
+                )
+                diag["candidate_block_reason"] = (
+                    first.get("block_reason") if isinstance(first, dict) else getattr(first, "block_reason", None)
+                )
+
+        if not text:
+            for attr in ("text", "output_text"):
+                v = getattr(llm_resp, attr, None)
+                if isinstance(v, str) and v.strip():
+                    text = v.strip()
+                    diag[f"{attr}_len"] = len(text)
+                    break
+
+        diag["final_text_len"] = len(text)
+        return text, diag
+
+    def _validate_llm_response_not_empty(self, llm_resp, run_id: str, stage: str) -> tuple[bool, str]:
+        text, diag = self._extract_llm_text_with_diag(llm_resp)
+        if text:
+            return True, "ok"
+        logger.warning(
+            f"[mc_log][{run_id}] {stage} LLM响应为空(candidate.content.parts可能为空): "
+            f"{json.dumps(diag, ensure_ascii=False)}"
+        )
+        return False, "empty_text_parts"
+
     async def _tool_read_archive_file(
         self,
         event: AstrMessageEvent,
         file_path: str,
         max_chars: int = MAX_ARCHIVE_TOOL_CHARS,
     ) -> str:
+        logger.info(
+            f"[mc_log][tool] read_archive_file 请求: "
+            f"file_path={self._preview_text(file_path)}, max_chars={max_chars}"
+        )
         file_map = self._get_active_archive_file_map(event)
         if not file_map:
             return "当前任务没有可读取的压缩包文件。"
@@ -801,6 +900,10 @@ class LogAnalyzer(Star):
         text = self._redact_text(self._read_text_with_fallback(resolved_path))
         if len(text) > limit:
             text = text[:limit] + "\n...[内容已截断]..."
+        logger.info(
+            f"[mc_log][tool] read_archive_file 命中: file={resolved_key}, "
+            f"raw_bytes={len(raw)}, returned_chars={len(text)}"
+        )
         return f"归档文件 `{resolved_key}` 内容:\n{text}"
 
     def _looks_like_multiple_paths(self, value: str) -> bool:
@@ -875,6 +978,10 @@ class LogAnalyzer(Star):
         if used >= limit:
             return False, f"read_archive_file 调用次数已达上限（{limit}）。"
         self._active_archive_tool_calls[key] = used + 1
+        logger.info(
+            f"[mc_log][tool] read_archive_file 调用计数: "
+            f"used={self._active_archive_tool_calls[key]}/{limit}"
+        )
         return True, ""
 
     def _clear_active_archive_file_map(self, event: AstrMessageEvent):
@@ -972,6 +1079,10 @@ class LogAnalyzer(Star):
         detected_name = self._detect_file_name_dummy(file_comp)
         safe_name = re.sub(r"[^\w\-.]", "_", detected_name or "upload.log")
         dst = work_dir / safe_name
+        logger.info(
+            f"[mc_log] 文件源已解析: detected_name={detected_name}, safe_name={safe_name}, "
+            f"src_type={'url' if str(src).startswith(('http://', 'https://')) else 'path'}"
+        )
 
         if str(src).startswith("http://") or str(src).startswith("https://"):
             try:
@@ -987,6 +1098,8 @@ class LogAnalyzer(Star):
                     dst=dst,
                     timeout_sec=timeout_sec,
                 )
+                if dst.exists():
+                    logger.info(f"[mc_log] 远程文件下载完成: bytes={dst.stat().st_size}, dst={dst.name}")
                 return dst if dst.exists() else None
             except Exception as exc:
                 if self._time_left(deadline) <= 0:
@@ -1003,7 +1116,10 @@ class LogAnalyzer(Star):
             safe_name = re.sub(r"[^\w\-.]", "_", src_path.name or "upload.log")
             dst = work_dir / safe_name
         shutil.copy2(src_path, dst)
-        logger.info(f"[mc_log] 已复制本地文件到工作目录: src={src_path.name}, dst={dst.name}")
+        logger.info(
+            f"[mc_log] 已复制本地文件到工作目录: src={src_path.name}, dst={dst.name}, "
+            f"bytes={dst.stat().st_size}"
+        )
         return dst
 
     def _detect_file_name_dummy(self, file_comp: Comp.File) -> str:
@@ -1104,6 +1220,8 @@ class LogAnalyzer(Star):
         if not extracted_paths:
             raise RuntimeError("archive has no extractable file")
         logger.info(f"[mc_log][{run_id}] 解压完成: extracted_count={len(extracted_paths)}")
+        preview_files = [f"{p.name}({p.stat().st_size}B)" for p in extracted_paths[:80] if p.exists()]
+        logger.info(f"[mc_log][{run_id}] 解压文件列表(前80): {preview_files}")
         archive_file_map = self._build_archive_file_map(extracted_paths, extract_root)
 
         selected = self._pick_priority_file(extracted_paths)
@@ -1170,10 +1288,13 @@ class LogAnalyzer(Star):
             base = out_dir.resolve()
             for info in infos:
                 if info.is_dir():
+                    logger.debug(f"[mc_log][zip] skip dir: {info.filename}")
                     continue
                 if self._zipinfo_is_link(info):
+                    logger.debug(f"[mc_log][zip] skip link/special: {info.filename}")
                     continue
                 if info.file_size > MAX_ARCHIVE_SINGLE_FILE_BYTES:
+                    logger.debug(f"[mc_log][zip] skip big file: {info.filename}, size={info.file_size}")
                     continue
                 total_bytes += info.file_size
                 if total_bytes > MAX_ARCHIVE_TOTAL_BYTES:
@@ -1182,6 +1303,7 @@ class LogAnalyzer(Star):
                 safe_rel = Path(info.filename)
                 target = (out_dir / safe_rel).resolve()
                 if not str(target).startswith(str(base)):
+                    logger.warning(f"[mc_log][zip] skip unsafe path: {info.filename}")
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1196,6 +1318,7 @@ class LogAnalyzer(Star):
                             raise RuntimeError("archive single file extracted size exceeded")
                         dst.write(chunk)
                 extracted.append(target)
+                logger.debug(f"[mc_log][zip] extracted: {info.filename}, size={written}")
         return extracted
 
     def _zipinfo_is_link(self, info: zipfile.ZipInfo) -> bool:
@@ -1232,9 +1355,11 @@ class LogAnalyzer(Star):
         ]
         files_list = list(files)
         lowered = [(p, p.name.lower()) for p in files_list]
+        logger.info(f"[mc_log] 归档候选文件: {[p.name for p in files_list]}")
         for key, _ in priority:
             for path, name in lowered:
                 if key in name:
+                    logger.info(f"[mc_log] 归档优先命中: key={key}, file={path.name}")
                     return path
         logger.debug(
             f"[mc_log] 归档内未找到优先关键词文件: {[p.name for p in files_list]}"
@@ -1334,6 +1459,10 @@ class LogAnalyzer(Star):
             return "", False
 
         selected = self._select_chunks_for_map(chunks, self.cfg["max_map_chunks"])
+        logger.info(
+            f"[mc_log][{run_id}] C策略分块统计: total_chunks={len(chunks)}, "
+            f"selected_chunks={len(selected)}, chunk_size={self.cfg['chunk_size']}"
+        )
         if len(chunks) > len(selected):
             logger.info(
                 f"[mc_log][{run_id}] C策略分块截断: total={len(chunks)}, selected={len(selected)}"
@@ -1396,6 +1525,10 @@ class LogAnalyzer(Star):
 
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
         top = scored[:max_chunks]
+        logger.info(
+            "[mc_log] C策略分块得分Top: "
+            + str([(idx, score, len(chunk)) for score, idx, chunk in top[:10]])
+        )
         top.sort(key=lambda x: x[1])
         return [(idx, chunk) for _, idx, chunk in top]
 
@@ -1444,6 +1577,7 @@ class LogAnalyzer(Star):
         deadline: float | None = None,
     ) -> tuple[str, bool]:
         if not ERROR_LINE_RE.search(chunk):
+            logger.debug(f"[mc_log][{run_id}] Map分块跳过(无错误行): idx={idx}/{total}, chars={len(chunk)}")
             return MR_SKIP, False
         map_system = self._get_prompt("map_system")
         map_user_tpl = self._get_prompt("map_user")
@@ -1459,6 +1593,10 @@ class LogAnalyzer(Star):
                 "chunk": chunk,
             },
         )
+        logger.info(
+            f"[mc_log][{run_id}] Map分块请求: idx={idx}/{total}, chunk_chars={len(chunk)}, "
+            f"prompt_chars={len(prompt)}, provider={map_provider_id}"
+        )
         try:
             timeout_sec = min(
                 float(self.cfg["map_llm_timeout_sec"]),
@@ -1469,6 +1607,9 @@ class LogAnalyzer(Star):
                     call_name=f"map_llm_generate[{idx}/{total}]",
                     run_id=run_id,
                     deadline=deadline,
+                    response_validator=lambda r: self._validate_llm_response_not_empty(
+                        r, run_id=run_id, stage=f"map_chunk_{idx}/{total}"
+                    ),
                     coro_factory=lambda: self.context.llm_generate(
                         chat_provider_id=map_provider_id,
                         system_prompt=map_system,
@@ -1477,9 +1618,15 @@ class LogAnalyzer(Star):
                 ),
                 timeout=timeout_sec,
             )
-            summary = (llm_resp.completion_text or "").strip()
+            summary, diag = self._extract_llm_text_with_diag(llm_resp)
+            summary = summary.strip()
             if not summary:
+                logger.warning(
+                    f"[mc_log][{run_id}] Map分块空摘要: idx={idx}/{total}, "
+                    f"diag={json.dumps(diag, ensure_ascii=False)}"
+                )
                 return MR_SKIP, False
+            logger.info(f"[mc_log][{run_id}] Map分块返回: idx={idx}/{total}, summary_chars={len(summary)}")
             return summary, False
         except asyncio.TimeoutError:
             logger.warning(
@@ -1611,6 +1758,18 @@ class LogAnalyzer(Star):
             + "\n\n"
             + self._build_available_files_prompt_block(available_archive_files or [])
         )
+        tool_names = []
+        if toolset:
+            try:
+                tool_names = [t.name for t in toolset.tools]
+            except Exception:
+                tool_names = []
+        logger.info(
+            f"[mc_log][{run_id}] 最终分析请求: provider={analyze_provider_id}, "
+            f"system_chars={len(system_prompt)}, prompt_chars={len(user_prompt)}, "
+            f"tools={tool_names}, max_steps={self.cfg['max_tool_calls']}, "
+            f"archive_files={len(available_archive_files or [])}"
+        )
         try:
             timeout_sec = min(
                 float(self.cfg["analyze_llm_timeout_sec"]),
@@ -1621,6 +1780,9 @@ class LogAnalyzer(Star):
                     call_name="analyze_tool_loop_agent",
                     run_id=run_id,
                     deadline=deadline,
+                    response_validator=lambda r: self._validate_llm_response_not_empty(
+                        r, run_id=run_id, stage="analyze"
+                    ),
                     coro_factory=lambda: self.context.tool_loop_agent(
                         event=event,
                         chat_provider_id=analyze_provider_id,
@@ -1633,10 +1795,15 @@ class LogAnalyzer(Star):
                 ),
                 timeout=timeout_sec,
             )
-            text = (llm_resp.completion_text or "").strip()
+            text, diag = self._extract_llm_text_with_diag(llm_resp)
+            text = text.strip()
             if text:
+                logger.info(f"[mc_log][{run_id}] 最终分析返回: chars={len(text)}")
                 return text
-            logger.error("[mc_log] 最终分析失败：LLM返回空内容")
+            logger.error(
+                f"[mc_log][{run_id}] 最终分析失败：LLM返回空内容, "
+                f"diag={json.dumps(diag, ensure_ascii=False)}"
+            )
         except asyncio.TimeoutError:
             logger.error(
                 f"[mc_log][{run_id}] 最终分析LLM超时: {self.cfg['analyze_llm_timeout_sec']}s"
@@ -1669,6 +1836,7 @@ class LogAnalyzer(Star):
         blocks = self._extract_fenced_code_blocks(markdown_text)
         if not blocks:
             return ""
+        logger.info(f"[mc_log] 检测到代码块数量: {len(blocks)}")
 
         parts = ["以下是分析结果中的代码块（便于复制）："]
         remaining = MAX_CODE_BLOCK_MESSAGE_CHARS - len(parts[0]) - 2
@@ -1729,6 +1897,7 @@ class LogAnalyzer(Star):
                     timeout=timeout_sec,
                 )
                 if url:
+                    logger.info(f"[mc_log][{run_id}] HTML渲染成功: url={self._preview_text(url, 200)}")
                     return "image_url", url
             except asyncio.TimeoutError:
                 logger.warning(
@@ -1744,6 +1913,7 @@ class LogAnalyzer(Star):
         if mode == "text_to_image":
             try:
                 b64 = self._render_text_image_base64(markdown_text)
+                logger.info(f"[mc_log][{run_id}] 文本转图成功: b64_chars={len(b64)}")
                 return "image_b64", b64
             except Exception as exc:
                 logger.warning(f"[mc_log][{run_id}] 文本转图片渲染失败: {exc}")
