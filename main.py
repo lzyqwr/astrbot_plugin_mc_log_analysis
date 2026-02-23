@@ -124,6 +124,7 @@ class LogAnalyzer(Star):
         self._tool_registered = False
         self._active_archive_file_maps: dict[str, dict[str, Path]] = {}
         self._active_archive_tool_calls: dict[str, int] = {}
+        self._active_primary_source_names: dict[str, str] = {}
         self.debug_log_path = Path(get_astrbot_data_path()) / "debug.log"
         self._debug_file_handler: logging.Handler | None = None
         self._debug_run_lock = asyncio.Lock()
@@ -266,6 +267,7 @@ class LogAnalyzer(Star):
                 extracted = self._apply_total_budget(extracted, self.cfg["total_char_limit"])
                 extracted_for_llm = self._redact_text(extracted)
                 self._set_active_archive_file_map(event, archive_file_map)
+                self._set_active_primary_source_name(event, source_name)
                 available_archive_files = sorted(archive_file_map.keys())
 
                 t_analyze = time.monotonic()
@@ -886,6 +888,11 @@ class LogAnalyzer(Star):
         resolved_key, resolved_path, err = self._resolve_archive_file_request(file_map, normalized)
         if not resolved_path:
             return err
+        if self._is_primary_source_file(event, resolved_key):
+            return (
+                f"`{resolved_key}` 已作为当前主分析日志输入，"
+                "无需重复读取。仅在当前日志无法提供有用信息时再读取其他文件。"
+            )
 
         try:
             raw = resolved_path.read_bytes()
@@ -961,11 +968,27 @@ class LogAnalyzer(Star):
         self._active_archive_file_maps[key] = dict(archive_file_map or {})
         self._active_archive_tool_calls[key] = 0
 
+    def _set_active_primary_source_name(self, event: AstrMessageEvent, source_name: str):
+        key = self._event_context_key(event)
+        if not key:
+            return
+        self._active_primary_source_names[key] = str(source_name or "").strip()
+
     def _get_active_archive_file_map(self, event: AstrMessageEvent) -> dict[str, Path]:
         key = self._event_context_key(event)
         if not key:
             return {}
         return self._active_archive_file_maps.get(key, {})
+
+    def _is_primary_source_file(self, event: AstrMessageEvent, archive_key: str) -> bool:
+        key = self._event_context_key(event)
+        if not key:
+            return False
+        source_name = str(self._active_primary_source_names.get(key, "") or "").strip().lower()
+        if not source_name:
+            return False
+        requested_name = Path(str(archive_key or "")).name.lower().strip()
+        return bool(requested_name and requested_name == source_name)
 
     def _consume_archive_tool_call(self, event: AstrMessageEvent) -> tuple[bool, str]:
         key = self._event_context_key(event)
@@ -990,6 +1013,7 @@ class LogAnalyzer(Star):
             return
         self._active_archive_file_maps.pop(key, None)
         self._active_archive_tool_calls.pop(key, None)
+        self._active_primary_source_names.pop(key, None)
 
     def _pick_target_file(self, event: AstrMessageEvent):
         files = [comp for comp in event.get_messages() if isinstance(comp, Comp.File)]
@@ -1829,6 +1853,9 @@ class LogAnalyzer(Star):
             "【可用归档文件列表】\n"
             f"如需补充证据，可调用工具 `read_archive_file(file_path, max_chars)`；"
             f"本次最多可调用 {limit} 次，且单次只能读取 1 个文件。\n"
+            "仅当当前已提供日志内容不足以支撑定位结论时才调用该工具。"
+            "若当前日志已能定位问题，请不要调用工具。\n"
+            "禁止读取当前主分析日志文件（避免重复读取）。\n"
             + "\n".join(lines)
         )
 
