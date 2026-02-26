@@ -1840,10 +1840,10 @@ class LogAnalyzer(Star):
             return "A"
         if "游戏崩溃" in name_lower:
             return "C"
-        if "debug" in name_lower or "日志" in name_lower or "log" in name_lower:
-            return "B"
         if "latest" in name_lower or "fcl" in name_lower or "pcl" in name_lower:
             return "C"
+        if "debug" in name_lower or "日志" in name_lower or "log" in name_lower:
+            return "B"
         return "C"
 
     def _read_text_with_fallback_blocking(
