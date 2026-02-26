@@ -2402,6 +2402,46 @@ class LogAnalyzer(Star):
             text, diag = self._extract_llm_text_with_diag(llm_resp)
             text = text.strip()
             if text:
+                suspect_reason = self._detect_suspect_analyze_text(text)
+                if suspect_reason:
+                    logger.warning(
+                        f"[mc_log][{run_id}] 最终分析返回疑似异常占位文本，触发无工具重试: reason={suspect_reason}"
+                    )
+                    fallback_prompt = (
+                        user_prompt
+                        + "\n\n"
+                        + "【工具状态】上一次模型响应疑似异常占位文本；"
+                        "请忽略该异常信息，不要转述内部报错。"
+                        "仅基于日志证据输出结构化结论；若证据不足请标注 UNCERTAIN。"
+                    )
+                    try:
+                        fallback_resp = await asyncio.wait_for(
+                            self._call_with_api_retry(
+                                call_name="analyze_llm_generate_suspect_retry",
+                                run_id=run_id,
+                                deadline=deadline,
+                                response_validator=lambda r: self._validate_llm_response_not_empty(
+                                    r, run_id=run_id, stage="analyze_suspect_retry"
+                                ),
+                                coro_factory=lambda: self.context.llm_generate(
+                                    chat_provider_id=analyze_provider_id,
+                                    system_prompt=system_prompt,
+                                    prompt=fallback_prompt,
+                                ),
+                            ),
+                            timeout=timeout_sec,
+                        )
+                        fb_text, _ = self._extract_llm_text_with_diag(fallback_resp)
+                        fb_text = fb_text.strip()
+                        if fb_text:
+                            logger.info(
+                                f"[mc_log][{run_id}] 疑似异常占位文本重试成功: chars={len(fb_text)}"
+                            )
+                            text = fb_text
+                    except Exception as fb_exc:
+                        logger.warning(
+                            f"[mc_log][{run_id}] 疑似异常占位文本重试失败，保留原结果: {fb_exc}"
+                        )
                 logger.info(f"[mc_log][{run_id}] 最终分析返回: chars={len(text)}")
                 if tool_failed:
                     logger.info(f"[mc_log][{run_id}] 工具失败降级原因: {tool_failure_reason}")
@@ -2419,6 +2459,27 @@ class LogAnalyzer(Star):
         except Exception as exc:
             logger.error(f"[mc_log][{run_id}] 最终分析LLM异常: {exc}", exc_info=True)
         return None
+
+    def _detect_suspect_analyze_text(self, text: str) -> str:
+        s = str(text or "").strip()
+        if not s:
+            return "empty"
+        lower = s.lower()
+        patterns = (
+            "candidate.content.parts",
+            "api 返回的",
+            "chat model",
+            "request error",
+            "tool_loop",
+            "模型请求失败",
+            "模型响应异常",
+        )
+        for pat in patterns:
+            if pat in s or pat in lower:
+                return pat
+        if len(s) <= 120 and ("请稍后重试" in s or "分析失败" in s):
+            return "short_failure_text"
+        return ""
 
     def _build_available_files_prompt_block(self, files: list[str]) -> str:
         limit = max(0, int(self.cfg.get("read_archive_file_limit", 1)))
