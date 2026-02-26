@@ -16,6 +16,11 @@
   - `html_to_image`（模板渲染）
   - `text_to_image`（Pillow）
 - 输出前自动脱敏（IP、邮箱、路径、token 等）。
+- 默认按“证据优先”输出（结论与步骤均要求证据编号，证据不足时标注 `UNCERTAIN`）。
+- 调试日志落盘前自动脱敏，避免敏感原文持久化。
+- 脱敏占位符采用确定性规则：`<IP>` / `<LAN_IP>` / `<HOST>` / `<PATH>` / `<USER>` / `<UUID>` / `<EMAIL>` / `<TOKEN>`。
+- 输出的“解决步骤”默认要求：可逆性提醒、风险等级（低/中/高）与端区分（Client/Server/Both），并按低→高风险排序。
+- 工具失败或超时时，仍会基于日志证据继续分析，并明确提示工具不可用/未搜到。
 
 ## 触发规则
 
@@ -40,6 +45,19 @@
 |---|---|---|---|
 | `chunk_size` | `int` | `100000` | Map-Reduce 分块字符数 |
 | `global_timeout_sec` | `int` | `180` | 全流程超时秒数（从命中文件消息开始计时） |
+| `rate_limit_user_sec` | `int` | `60` | 按用户维度限频间隔（秒），0 表示不限制 |
+| `queue_wait_sec` | `int` | `8` | 全局并发队列等待时间（秒） |
+| `max_concurrent_jobs` | `int` | `2` | 全局并发处理上限 |
+| `max_concurrent_io` | `int` | `1` | 重 I/O 阶段并发上限（解压/大文件读写/清理） |
+| `max_input_file_bytes` | `int` | `33554432` | 单次上传/下载文件最大字节数 |
+| `max_archive_file_count` | `int` | `160` | 压缩包内最大文件数量 |
+| `max_archive_single_file_bytes` | `int` | `12582912` | 压缩包内单文件最大字节数 |
+| `max_archive_total_bytes` | `int` | `33554432` | 压缩包解压后总字节数上限 |
+| `max_gz_output_bytes` | `int` | `16777216` | gz 解压后最大字节数 |
+| `must_keep_window_lines` | `int` | `30` | 强制保留证据窗口行数（上下各 N 行） |
+| `diag_version` | `string` | `1.0.0` | 诊断系统版本号 |
+| `metrics_enabled` | `bool` | `true` | 是否启用结构化指标落库 |
+| `metrics_path` | `string` | `audit_metrics.jsonl` | 指标落库文件名（相对 data 目录） |
 | `map_select_provider` | `string(select_provider)` | `""` | Map 阶段模型提供商（必填） |
 | `analyze_select_provider` | `string(select_provider)` | `""` | 最终分析阶段模型提供商（必填） |
 | `render_mode` | `string` | `html_to_image` | 渲染模式：`html_to_image` / `text_to_image` |
@@ -49,6 +67,7 @@
 | `max_tool_calls` | `int` | `6` | 单次分析最大工具调用次数 |
 | `tool_timeout_sec` | `int` | `120` | 单次工具调用超时秒数 |
 | `tool_retry_limit` | `int` | `1` | 单次工具调用失败重试上限 |
+| `tool_snippet_chars` | `int` | `600` | 工具结果进入模型前的截断字符数 |
 | `map_llm_timeout_sec` | `int` | `120` | Map 阶段单片段 LLM 超时秒数 |
 | `analyze_llm_timeout_sec` | `int` | `240` | 最终分析 LLM 超时秒数 |
 | `max_map_chunks` | `int` | `10` | Map 阶段最多送入 LLM 的片段数 |

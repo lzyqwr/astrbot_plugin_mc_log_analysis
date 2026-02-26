@@ -9,6 +9,71 @@
     "type": "int",
     "default": 300
   },
+  "rate_limit_user_sec": {
+    "description": "按用户维度的限频间隔（秒），0 表示不限制",
+    "type": "int",
+    "default": 60
+  },
+  "queue_wait_sec": {
+    "description": "全局并发队列等待时间（秒），0 表示不等待直接占用",
+    "type": "int",
+    "default": 8
+  },
+  "max_concurrent_jobs": {
+    "description": "全局并发处理上限",
+    "type": "int",
+    "default": 2
+  },
+  "max_concurrent_io": {
+    "description": "重 I/O 阶段并发上限（解压/大文件读写/清理）",
+    "type": "int",
+    "default": 1
+  },
+  "max_input_file_bytes": {
+    "description": "单次上传/下载文件最大字节数",
+    "type": "int",
+    "default": 33554432
+  },
+  "max_archive_file_count": {
+    "description": "压缩包内最大文件数量",
+    "type": "int",
+    "default": 160
+  },
+  "max_archive_single_file_bytes": {
+    "description": "压缩包内单文件最大字节数",
+    "type": "int",
+    "default": 12582912
+  },
+  "max_archive_total_bytes": {
+    "description": "压缩包解压后总字节数上限",
+    "type": "int",
+    "default": 33554432
+  },
+  "max_gz_output_bytes": {
+    "description": "gz 解压后最大字节数",
+    "type": "int",
+    "default": 16777216
+  },
+  "must_keep_window_lines": {
+    "description": "强制保留证据的窗口行数（上下各 N 行）",
+    "type": "int",
+    "default": 30
+  },
+  "diag_version": {
+    "description": "诊断系统版本号（对外可见）",
+    "type": "string",
+    "default": "1.0.0"
+  },
+  "metrics_enabled": {
+    "description": "是否启用结构化指标落库",
+    "type": "bool",
+    "default": true
+  },
+  "metrics_path": {
+    "description": "指标落库文件名（相对 data 目录）",
+    "type": "string",
+    "default": "audit_metrics.jsonl"
+  },
   "map_select_provider": {
     "description": "Map阶段使用的模型提供商",
     "type": "string",
@@ -56,6 +121,11 @@
     "description": "单次工具调用失败重试上限",
     "type": "int",
     "default": 1
+  },
+  "tool_snippet_chars": {
+    "description": "工具结果进入模型前的截断字符数",
+    "type": "int",
+    "default": 600
   },
   "api_retry_limit": {
     "description": "API 因服务端原因失败时的最大重试次数（429/5xx/服务过载等）",
@@ -116,6 +186,21 @@
         "type": "string",
         "default": "日志文件下载失败，请稍后重试。"
       },
+      "rate_limited": {
+        "description": "触发用户限频提示",
+        "type": "string",
+        "default": "请求过于频繁，请稍后再试。"
+      },
+      "queue_busy": {
+        "description": "全局并发队列超时提示",
+        "type": "string",
+        "default": "当前任务较多，请稍后再试。"
+      },
+      "file_too_large": {
+        "description": "文件超过资源预算提示",
+        "type": "string",
+        "default": "文件过大，超过处理上限，请拆分或压缩后重试。"
+      },
       "no_extractable_content": {
         "description": "未识别到可分析内容提示",
         "type": "string",
@@ -124,7 +209,7 @@
       "analyze_failed_logged": {
         "description": "LLM 分析失败提示",
         "type": "string",
-        "default": "日志分析失败，已记录日志，请联系管理员检查检查。"
+        "default": "日志分析失败，已记录日志，请联系管理员检查。"
       },
       "analyze_failed_retry": {
         "description": "流程异常提示",
