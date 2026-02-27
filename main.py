@@ -292,7 +292,7 @@ class LogAnalyzer(Star):
             yield result
             return
 
-        acquired = await self._acquire_global_slot()
+        acquired = await self._acquire_global_slot(run_id="pre")
         if not acquired:
             result = event.plain_result(self._msg("queue_busy"))
             result.stop_event()
@@ -487,7 +487,7 @@ class LogAnalyzer(Star):
                 await self._stop_debug_capture(run_id)
         finally:
             MC_RUN_ID_CTX.reset(run_token)
-            await self._release_global_slot()
+            await self._release_global_slot(run_id=run_id)
 
     async def _start_debug_capture(
         self,
@@ -701,28 +701,46 @@ class LogAnalyzer(Star):
             self._rate_limit_map[user_id] = now
         return True
 
-    async def _acquire_global_slot(self) -> bool:
+    async def _acquire_global_slot(self, run_id: str = "") -> bool:
         wait_sec = float(self.cfg.get("queue_wait_sec", 0))
         if wait_sec <= 0:
             await self._global_sema.acquire()
             async with self._active_jobs_lock:
                 self._active_jobs += 1
+                logger.info(
+                    f"[mc_log][{run_id}] 获取全局并发槽位: "
+                    f"active_jobs={self._active_jobs}, max={self._global_sema_size}"
+                )
             return True
         try:
             await asyncio.wait_for(self._global_sema.acquire(), timeout=wait_sec)
         except asyncio.TimeoutError:
+            logger.warning(
+                f"[mc_log][{run_id}] 等待全局并发槽位超时: "
+                f"wait_sec={wait_sec}, active_jobs={self._active_jobs}, max={self._global_sema_size}"
+            )
             return False
         async with self._active_jobs_lock:
             self._active_jobs += 1
+            logger.info(
+                f"[mc_log][{run_id}] 获取全局并发槽位: "
+                f"active_jobs={self._active_jobs}, max={self._global_sema_size}"
+            )
         return True
 
-    async def _release_global_slot(self):
+    async def _release_global_slot(self, run_id: str = ""):
+        released = False
         try:
             self._global_sema.release()
-        except Exception:
-            return
+            released = True
+        except Exception as exc:
+            logger.warning(f"[mc_log][{run_id}] 释放全局并发槽位异常: {exc}")
         async with self._active_jobs_lock:
             self._active_jobs = max(0, self._active_jobs - 1)
+            logger.info(
+                f"[mc_log][{run_id}] 释放全局并发槽位: "
+                f"released={released}, active_jobs={self._active_jobs}, max={self._global_sema_size}"
+            )
 
     def _ensure_not_timed_out(self, deadline: float | None, run_id: str = "", stage: str = ""):
         left = self._time_left(deadline)
