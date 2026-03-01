@@ -191,7 +191,7 @@ def _build_mc_run_record_factory(prev_factory):
     "astrbot_plugin_mc_log_analysis",
     "lzyqwr",
     "Minecraft 日志分析插件",
-    "2.0.0",
+    "2.0.1",
     "https://github.com/lzyqwr/astrbot_plugin_mc_log_analysis",
 )
 class LogAnalyzer(Star):
@@ -1874,11 +1874,11 @@ class LogAnalyzer(Star):
         priority = [
             ("hs_err", "A"),
             ("crash", "A"),
+            ("latest", "C"),
             ("游戏崩溃", "C"),
-            ("debug", "B"),
             ("日志", "B"),
             ("log", "B"),
-            ("latest", "C"),
+            ("debug", "B"),
             ("fcl", "C"),
             ("pcl", "C"),
         ]
@@ -2673,7 +2673,7 @@ class LogAnalyzer(Star):
             template,
             {
                 "message": markdown_text,
-                "content": markdown_text,
+                "text": markdown_text,
                 "time": time_str,
                 "image_width": image_width,
             },
