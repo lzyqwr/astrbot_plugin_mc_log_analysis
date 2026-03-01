@@ -171,6 +171,10 @@ class _BudgetExceeded(RuntimeError):
     pass
 
 
+class _FlowDone(RuntimeError):
+    pass
+
+
 def _build_mc_run_record_factory(prev_factory):
     def _factory(*args, **kwargs):
         record = prev_factory(*args, **kwargs)
@@ -301,6 +305,30 @@ class LogAnalyzer(Star):
 
         run_id = self._build_run_id(event)
         run_token = MC_RUN_ID_CTX.set(run_id)
+        terminal_result = None
+        terminal_extra_result = None
+        slot_released = False
+
+        async def _release_slot_once(reason: str):
+            nonlocal slot_released
+            if slot_released:
+                logger.info(f"[mc_log][{run_id}] 跳过重复释放全局并发槽位: reason={reason}")
+                return
+            slot_released = True
+            await self._release_global_slot(run_id=run_id)
+
+        async def _watchdog_release():
+            try:
+                delay = float(self.cfg["global_timeout_sec"]) + 5.0
+                await asyncio.sleep(max(0.0, delay))
+                logger.warning(f"[mc_log][{run_id}] 任务疑似卡住，watchdog 触发释放槽位")
+                await _release_slot_once("watchdog")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning(f"[mc_log][{run_id}] watchdog 异常: {exc}")
+
+        watchdog_task = asyncio.create_task(_watchdog_release())
         try:
             await self._start_debug_capture(run_id, event, self._detect_file_name(event, file_comp), is_archive)
             started = time.monotonic()
@@ -322,8 +350,8 @@ class LogAnalyzer(Star):
                     logger.error("[mc_log] 提示词模板未就绪，已终止本次分析")
                     result = event.plain_result(self._msg("prompt_missing"))
                     result.stop_event()
-                    yield result
-                    return
+                    terminal_result = result
+                    raise _FlowDone("prompt missing")
 
                 map_provider_id, analyze_provider_id = self._configured_provider_ids()
                 if not map_provider_id or not analyze_provider_id:
@@ -333,8 +361,8 @@ class LogAnalyzer(Star):
                     )
                     result = event.plain_result(self._msg("provider_not_configured"))
                     result.stop_event()
-                    yield result
-                    return
+                    terminal_result = result
+                    raise _FlowDone("provider not configured")
                 if not self.context.get_provider_by_id(map_provider_id) or not self.context.get_provider_by_id(
                     analyze_provider_id
                 ):
@@ -344,8 +372,8 @@ class LogAnalyzer(Star):
                     )
                     result = event.plain_result(self._msg("provider_not_configured"))
                     result.stop_event()
-                    yield result
-                    return
+                    terminal_result = result
+                    raise _FlowDone("provider missing")
 
                 accepted_notice = self._msg("accepted_notice")
                 if accepted_notice:
@@ -375,8 +403,8 @@ class LogAnalyzer(Star):
                     logger.warning(f"[mc_log][{run_id}] 下载阶段失败，未获取到本地文件")
                     result = event.plain_result(self._msg("download_failed"))
                     result.stop_event()
-                    yield result
-                    return
+                    terminal_result = result
+                    raise _FlowDone("download failed")
 
                 t_extract = time.monotonic()
                 extracted, source_name, strategy, skip_final_analyze, archive_file_map = await self._extract_content(
@@ -397,8 +425,8 @@ class LogAnalyzer(Star):
                     logger.warning(f"[mc_log][{run_id}] 提取结果为空，无法继续分析")
                     result = event.plain_result(self._msg("no_extractable_content"))
                     result.stop_event()
-                    yield result
-                    return
+                    terminal_result = result
+                    raise _FlowDone("no extractable content")
 
                 extracted = self._apply_total_budget(extracted, self.cfg["total_char_limit"])
                 extracted_for_llm = self._privacy_guard_for_llm(extracted)
@@ -427,8 +455,8 @@ class LogAnalyzer(Star):
                     metrics_data["needs_more_info"] = True
                     result = event.plain_result(self._msg("analyze_failed_logged"))
                     result.stop_event()
-                    yield result
-                    return
+                    terminal_result = result
+                    raise _FlowDone("empty analyze result")
                 report_md = self._privacy_guard_for_output(report_md)
                 metrics_data.update(self._extract_metrics_from_report(report_md))
 
@@ -455,30 +483,33 @@ class LogAnalyzer(Star):
                     report_md=report_md,
                 )
                 response.stop_event()
-                yield response
+                terminal_result = response
                 code_blocks_text = self._build_code_blocks_message(report_md)
                 if code_blocks_text:
                     code_result = event.plain_result(code_blocks_text)
                     code_result.stop_event()
-                    yield code_result
+                    terminal_extra_result = code_result
+                raise _FlowDone("done")
+            except _FlowDone:
+                pass
             except _BudgetExceeded as exc:
                 logger.warning(f"[mc_log][{run_id}] 资源预算超限: {exc}")
                 metrics_data["needs_more_info"] = True
                 result = event.plain_result(self._msg("file_too_large"))
                 result.stop_event()
-                yield result
+                terminal_result = result
             except TimeoutError as exc:
                 logger.warning(f"[mc_log][{run_id}] 全局超时: {exc}")
                 metrics_data["needs_more_info"] = True
                 result = event.plain_result(self._msg("global_timeout"))
                 result.stop_event()
-                yield result
+                terminal_result = result
             except Exception as exc:
                 logger.error(f"[mc_log][{run_id}] 处理流程异常: {exc}", exc_info=True)
                 metrics_data["needs_more_info"] = True
                 result = event.plain_result(self._msg("analyze_failed_retry"))
                 result.stop_event()
-                yield result
+                terminal_result = result
             finally:
                 await self._write_metrics(metrics_data)
                 self._clear_active_archive_file_map(event)
@@ -486,8 +517,19 @@ class LogAnalyzer(Star):
                     await self._safe_remove_dir(work_dir, deadline=deadline)
                 await self._stop_debug_capture(run_id)
         finally:
+            if watchdog_task:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except Exception:
+                    pass
             MC_RUN_ID_CTX.reset(run_token)
-            await self._release_global_slot(run_id=run_id)
+            await _release_slot_once("finally")
+
+        if terminal_result is not None:
+            yield terminal_result
+        if terminal_extra_result is not None:
+            yield terminal_extra_result
 
     async def _start_debug_capture(
         self,
