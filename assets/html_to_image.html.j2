@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width={{ image_width | default(640) }}, initial-scale=1.0">
+    <title>Minecraft Diagnostic Card</title>
+
+    <script src="https://unpkg.com/marked@4.3.0/marked.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/@highlightjs/cdn-assets@11.7.0/styles/github.min.css">
+    <script src="https://unpkg.com/@highlightjs/cdn-assets@11.7.0/highlight.min.js"></script>
+
+    <style>
+        :root {
+            --card-width: {{ image_width | default(640) }}px;
+        }
+
+        html {
+            background: transparent !important;
+            margin: 0;
+            padding: 0;
+            width: var(--card-width);
+            max-width: var(--card-width);
+            min-width: var(--card-width);
+            overflow-x: hidden;
+        }
+
+        body {
+            width: var(--card-width);
+            max-width: var(--card-width);
+            min-width: var(--card-width);
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            background-color: transparent !important;
+            font-family: -apple-system, "Microsoft YaHei", sans-serif;
+            color: #24292e;
+            line-height: 1.6;
+            display: block;
+            overflow-x: hidden;
+            border: none;
+        }
+
+        .card {
+            width: var(--card-width);
+            max-width: var(--card-width);
+            box-sizing: border-box;
+            background-color: #ffffff;
+            border: 1px solid #eaecef;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 0;
+        }
+
+        .header {
+            border-bottom: 1px solid #eaecef;
+            padding-bottom: 15px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            font-size: 18px;
+            font-weight: 700;
+            color: #1f2328;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0;
+        }
+
+        .icon-box {
+            width: 6px;
+            height: 20px;
+            background-color: #d73a49;
+            border-radius: 3px;
+            display: inline-block;
+        }
+
+        .timestamp {
+            font-size: 11px;
+            color: #6e7781;
+            font-family: Consolas, monospace;
+        }
+
+        #content {
+            font-size: 14px;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+
+        #content h1, #content h2 {
+            border-bottom: 1px solid #eaecef;
+            padding-bottom: 0.3em;
+            margin-top: 20px;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        #content h3 { margin-top: 15px; font-size: 1.1em; }
+
+        #content p { margin-bottom: 12px; }
+
+        #content pre {
+            padding: 12px;
+            overflow-x: hidden;
+            font-size: 12px;
+            line-height: 1.45;
+            background-color: #f6f8fa;
+            border-radius: 6px;
+            margin-bottom: 12px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            border: 1px solid #d0d7de;
+        }
+
+        #content code {
+            padding: 0.2em 0.4em;
+            font-size: 85%;
+            background-color: rgba(175, 184, 193, 0.2);
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+        }
+
+        #content pre code {
+            padding: 0;
+            background-color: transparent;
+        }
+
+        #content blockquote {
+            padding: 0 1em;
+            color: #57606a;
+            border-left: 0.25em solid #d0d7de;
+            margin: 0 0 16px 0;
+        }
+
+        .footer {
+            margin-top: 25px;
+            padding-top: 15px;
+            border-top: 1px solid #eaecef;
+            text-align: right;
+            font-size: 10px;
+            color: #8c959f;
+        }
+
+        #raw-markdown { display: none; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <div class="header">
+            <h1><span class="icon-box"></span>分析结果</h1>
+            <span class="timestamp" id="current-time">{{ time | default('Generating...') }}</span>
+        </div>
+
+        <textarea id="raw-markdown">
+{{ message or content or "Error: No data received." }}
+        </textarea>
+
+        <div id="content"></div>
+
+        <div class="footer">
+            内容由AI生成
+        </div>
+    </div>
+
+    <script>
+        window.onload = function() {
+            try {
+                const rawEl = document.getElementById('raw-markdown');
+                let rawText = rawEl.value || "";
+
+                if (rawText.includes('\\n')) {
+                    rawText = rawText.replace(/\\n/g, '\n');
+                }
+
+                if (typeof marked !== 'undefined') {
+                    const contentDiv = document.getElementById('content');
+                    contentDiv.innerHTML = marked.parse(rawText);
+                } else {
+                    document.getElementById('content').innerText = "Error: marked.js failed to load.";
+                }
+
+                if (typeof hljs !== 'undefined') {
+                    document.querySelectorAll('pre code').forEach((block) => {
+                        hljs.highlightElement(block);
+                    });
+                }
+
+                const timeEl = document.getElementById('current-time');
+                if (timeEl.innerText === 'Generating...') {
+                    const now = new Date();
+                    timeEl.innerText = now.getFullYear() + '/' + 
+                                       (now.getMonth()+1).toString().padStart(2,'0') + '/' + 
+                                       now.getDate().toString().padStart(2,'0') + ' ' + 
+                                       now.getHours().toString().padStart(2,'0') + ':' + 
+                                       now.getMinutes().toString().padStart(2,'0');
+                }
+            } catch (e) {
+                console.error(e);
+                document.getElementById('content').innerHTML = "<p style='color:red'>Render Error: " + e.message + "</p>";
+            }
+        };
+    </script>
+</body>
+</html>
