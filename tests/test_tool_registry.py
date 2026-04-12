@@ -210,6 +210,18 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
         result = await self.registry.tool_read_archive_file(self.event, "bin.dat")
         self.assertIn("二进制文件", result)
 
+    async def test_read_archive_file_gb18030_text_is_readable(self):
+        path = self.case_root / "latest.log"
+        text = "[00:10:02] [main/ERROR]: 75服务端启动异常\nCaused by: 缺少依赖"
+        path.write_bytes(text.encode("gb18030"))
+        self.runtime.set_active_archive_file_map(self.event, {"logs/latest.log": path})
+
+        result = await self.registry.tool_read_archive_file(self.event, "logs/latest.log")
+
+        self.assertIn("75服务端启动异常", result)
+        self.assertIn("缺少依赖", result)
+        self.assertNotIn("二进制文件", result)
+
     async def test_search_tool_docs_updated(self):
         analyze_system = Path("assets/analyze_system.txt").read_text(encoding="utf-8")
         readme = Path("README.md").read_text(encoding="utf-8")

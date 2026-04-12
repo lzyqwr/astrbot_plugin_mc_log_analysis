@@ -147,6 +147,42 @@ class DomainLogicTests(unittest.TestCase):
         self.assertIn("[tool:mcmod]", sanitized)
         self.assertIn("untrusted_instruction", sanitized)
 
+    def test_file_adapter_reads_gb18030_without_false_utf16_decode(self):
+        case_root = DATA_ROOT / "encoding_cases"
+        case_root.mkdir(parents=True, exist_ok=True)
+        path = case_root / "gb18030.log"
+        text = "75服务端启动异常"
+        path.write_bytes(text.encode("gb18030"))
+
+        adapter = FileAdapter(ConfigManager({}), PluginRuntime())
+        result = asyncio.run(adapter.read_text_with_fallback(path))
+
+        self.assertEqual(result, text)
+
+    def test_file_adapter_reads_utf16_with_bom(self):
+        case_root = DATA_ROOT / "encoding_cases"
+        case_root.mkdir(parents=True, exist_ok=True)
+        path = case_root / "utf16_bom.log"
+        text = "[00:00:01] [main/ERROR]: Exception in thread main"
+        path.write_bytes(text.encode("utf-16"))
+
+        adapter = FileAdapter(ConfigManager({}), PluginRuntime())
+        result = asyncio.run(adapter.read_text_with_fallback(path))
+
+        self.assertEqual(result, text)
+
+    def test_file_adapter_reads_utf16_without_bom_when_hint_present(self):
+        case_root = DATA_ROOT / "encoding_cases"
+        case_root.mkdir(parents=True, exist_ok=True)
+        path = case_root / "utf16_no_bom.log"
+        text = "[00:00:01] [main/ERROR]: Minecraft Version: 1.20.1\nCaused by: java.lang.RuntimeException"
+        path.write_bytes(text.encode("utf-16-le"))
+
+        adapter = FileAdapter(ConfigManager({}), PluginRuntime())
+        result = asyncio.run(adapter.read_text_with_fallback(path))
+
+        self.assertEqual(result, text)
+
     def test_strategy_c_regex_filter_preserves_key_info(self):
         config_manager = ConfigManager({"must_keep_window_lines": 2, "total_char_limit": 12000})
         extraction = ExtractionDomain(config_manager.get)
@@ -199,6 +235,31 @@ class DomainLogicTests(unittest.TestCase):
 
         self.assertEqual(result, expected)
         self.assertTrue(result.strip())
+
+    def test_strategy_c_extract_keeps_gb18030_text_readable(self):
+        case_root = DATA_ROOT / "encoding_cases"
+        case_root.mkdir(parents=True, exist_ok=True)
+        path = case_root / "latest.log"
+        content = "\n".join(
+            [
+                "[00:10:01] [main/INFO]: Minecraft Version: 1.20.1",
+                "[00:10:02] [main/ERROR]: 75服务端启动异常",
+                "[00:10:02] [main/ERROR]: Caused by: java.lang.IllegalStateException: 缺少依赖",
+                "[00:10:03] [main/ERROR]: Mod File: examplemod-1.0.jar",
+                "[00:10:03] [main/ERROR]: at com.example.Loader.load(Loader.java:42)",
+            ]
+        )
+        path.write_bytes(content.encode("gb18030"))
+
+        config_manager = ConfigManager({"must_keep_window_lines": 2, "total_char_limit": 20000})
+        extraction = ExtractionDomain(config_manager.get)
+        adapter = FileAdapter(config_manager, PluginRuntime())
+        result = asyncio.run(extraction.strategy_c_extract(path, adapter.read_text_with_fallback))
+
+        self.assertIn("75服务端启动异常", result)
+        self.assertIn("缺少依赖", result)
+        self.assertIn("examplemod-1.0.jar", result)
+        self.assertIn("Loader.java:42", result)
 
     def test_safe_extract_zip_skips_unsafe_member_paths(self):
         case_root = DATA_ROOT / "zip_security"
