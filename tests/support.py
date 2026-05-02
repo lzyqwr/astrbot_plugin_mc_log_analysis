@@ -58,6 +58,10 @@ def install_astrbot_stubs():
         def fromBase64(cls, value):
             return cls(value, "b64")
 
+        @classmethod
+        def fromFileSystem(cls, value):
+            return cls(value, "file")
+
     class Node:
         def __init__(self, content, name="", uin=""):
             self.content = content

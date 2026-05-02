@@ -7,6 +7,8 @@ import os
 import re
 import textwrap
 import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
@@ -43,15 +45,42 @@ class RenderingAdapter:
             return sample
         return sample[:limit] + "...[truncated]"
 
+    def _html_render_payload(self, markdown_text: str) -> tuple[dict, dict]:
+        time_str = time.strftime("%Y/%m/%d %H:%M", time.localtime())
+        image_width = int(self._cfg().get("image_width", 640))
+        data = {
+            "message": markdown_text,
+            "text": markdown_text,
+            "time": time_str,
+            "image_width": image_width,
+        }
+        options = {
+            "type": "png",
+            "quality": None,
+            "omit_background": True,
+            "full_page": True,
+            "viewport_width": image_width,
+            "animations": "disabled",
+            "caret": "hide",
+            "scale": "css",
+        }
+        return data, options
+
+    def _render_cache_dir(self) -> Path:
+        render_dir = self.runtime.temp_root / "rendered_images"
+        render_dir.mkdir(parents=True, exist_ok=True)
+        (render_dir / ".mc_log_analysis").write_text("1", encoding="utf-8")
+        return render_dir
+
     async def render_report(self, markdown_text: str, run_id: str = "", deadline: float | None = None) -> tuple[str, str]:
         mode = self._cfg()["render_mode"]
         if mode == "html_to_image":
             try:
                 timeout_sec = min(float(self._cfg()["html_render_timeout_sec"]), max(0.1, self.runtime.time_left(deadline)))
-                url = await asyncio.wait_for(self.render_markdown_html(markdown_text), timeout=timeout_sec)
-                if url:
-                    logger.info(f"[mc_log][{run_id}] HTML渲染成功: url={self._preview_text(url, 200)}")
-                    return "image_url", url
+                image_path = await asyncio.wait_for(self.render_markdown_html_file(markdown_text), timeout=timeout_sec)
+                if image_path:
+                    logger.info(f"[mc_log][{run_id}] HTML本地图片渲染成功: path={self._preview_text(image_path, 200)}")
+                    return "image_file", image_path
             except asyncio.TimeoutError:
                 logger.warning(f"[mc_log][{run_id}] HTML渲染超时: {self._cfg()['html_render_timeout_sec']}s")
                 if self.runtime.time_left(deadline) <= 0:
@@ -73,9 +102,9 @@ class RenderingAdapter:
 
         logger.warning(f"[mc_log][{run_id}] 未知渲染模式: {mode}，回退到HTML渲染")
         try:
-            url = await asyncio.wait_for(self.render_markdown_html(markdown_text), timeout=self._cfg()["html_render_timeout_sec"])
-            if url:
-                return "image_url", url
+            image_path = await asyncio.wait_for(self.render_markdown_html_file(markdown_text), timeout=self._cfg()["html_render_timeout_sec"])
+            if image_path:
+                return "image_file", image_path
         except Exception as exc:
             logger.warning(f"[mc_log][{run_id}] 未知模式回退后 HTML渲染仍失败: {exc}")
         fallback = markdown_text + "\n\n" + self._msg("html_render_fallback_notice")
@@ -85,28 +114,40 @@ class RenderingAdapter:
         if not self.html_template_path.exists():
             raise FileNotFoundError(f"html template not found: {self.html_template_path}")
         template = self.html_template_path.read_text(encoding="utf-8")
-        time_str = time.strftime("%Y/%m/%d %H:%M", time.localtime())
-        image_width = int(self._cfg().get("image_width", 640))
+        data, options = self._html_render_payload(markdown_text)
         url = await self.html_render_func(
             template,
-            {
-                "message": markdown_text,
-                "text": markdown_text,
-                "time": time_str,
-                "image_width": image_width,
-            },
-            options={
-                "type": "png",
-                "quality": None,
-                "omit_background": True,
-                "full_page": True,
-                "viewport_width": image_width,
-                "animations": "disabled",
-                "caret": "hide",
-                "scale": "css",
-            },
+            data,
+            options=options,
         )
         return str(url)
+
+    async def render_markdown_html_file(self, markdown_text: str) -> str:
+        rendered = await self.render_markdown_html(markdown_text)
+        if rendered.startswith(("http://", "https://")):
+            return await self.download_rendered_image(rendered)
+        if rendered.startswith("file:///"):
+            rendered = rendered[8:]
+        image_path = Path(rendered).expanduser().resolve()
+        if not image_path.exists():
+            raise FileNotFoundError(f"rendered image not found: {image_path}")
+        return str(image_path)
+
+    async def download_rendered_image(self, url: str) -> str:
+        return await asyncio.to_thread(self.download_rendered_image_blocking, url)
+
+    def download_rendered_image_blocking(self, url: str) -> str:
+        render_dir = self._render_cache_dir()
+        path = render_dir / f"rendered_{uuid.uuid4().hex}.png"
+        timeout_sec = max(5, int(self._cfg().get("html_render_timeout_sec", 30)))
+        request = urllib.request.Request(url, headers={"User-Agent": "astrbot-plugin-mc-log-analysis/1.0"})
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response, open(path, "wb") as file_obj:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_obj.write(chunk)
+        return str(path.resolve())
 
     def render_text_image_base64(self, text: str) -> str:
         if not PIL_AVAILABLE:
@@ -160,6 +201,8 @@ class RenderingAdapter:
         node1 = Comp.Node(content=[Comp.Plain(summary)], name=sender_name, uin=sender_uin)
         if render_mode == "image_url":
             core_content = [Comp.Image.fromURL(render_payload)]
+        elif render_mode == "image_file":
+            core_content = [Comp.Image.fromFileSystem(render_payload)]
         elif render_mode == "image_b64":
             core_content = [Comp.Image.fromBase64(render_payload)]
         else:

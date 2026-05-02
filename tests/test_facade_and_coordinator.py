@@ -71,6 +71,46 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("正在分析", results[0].payload)
         self.assertTrue(results[-1].payload)
 
+    async def test_html_render_downloads_url_image_for_forward_message(self):
+        log_path = self.case_root / "latest-local-image.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "[00:10:02] [main/INFO]: Minecraft Version: 1.20.1",
+                    "[00:10:05] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        context = FakeContext(provider_ids={"provider-a"})
+        plugin = LogAnalyzer(context, {"analyze_select_provider": "provider-a"})
+        plugin.prompt_manager.prompts = {
+            "analyze_system": "z",
+            "analyze_user": "k {{content}}",
+        }
+        plugin.prompt_manager.prompts_ready = True
+        image_path = self.case_root / "downloaded-render.png"
+        image_path.write_bytes(b"png")
+
+        async def fake_html_render(template, values, options=None):
+            return "https://example.com/rendered.png"
+
+        async def fake_download_rendered_image(url):
+            self.assertEqual(url, "https://example.com/rendered.png")
+            return str(image_path)
+
+        plugin.rendering_adapter.html_render_func = fake_html_render
+        plugin.rendering_adapter.download_rendered_image = fake_download_rendered_image
+        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(log_path))])
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        forwarded_nodes = results[-1].payload[0].nodes
+        image = forwarded_nodes[1].content[0]
+        actual_path = Path(getattr(image, "value", None) or getattr(image, "path", ""))
+        self.assertTrue(actual_path.exists())
+        self.assertEqual(actual_path.read_bytes(), b"png")
+
     async def test_on_message_runs_for_whitelisted_session(self):
         log_path = self.case_root / "latest-whitelist.log"
         log_path.write_text(
