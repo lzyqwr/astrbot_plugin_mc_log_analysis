@@ -18,10 +18,10 @@
   "render_mode": {
     "description": "输出设置 / 渲染模式",
     "type": "string",
-    "options": ["html_to_image", "text_to_image"],
-    "labels": ["HTML 转图片", "文本转图片"],
+    "options": ["html_to_image", "text_to_image", "plain_text"],
+    "labels": ["HTML 转图片", "文本转图片", "纯文本发送"],
     "default": "html_to_image",
-    "hint": "推荐优先使用 HTML 转图片，排版更完整。"
+    "hint": "推荐优先使用 HTML 转图片，排版更完整；老旧客户端无法查看合并转发时可选纯文本发送。"
   },
   "image_width": {
     "description": "输出设置 / 图片宽度",

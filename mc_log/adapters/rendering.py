@@ -74,6 +74,10 @@ class RenderingAdapter:
 
     async def render_report(self, markdown_text: str, run_id: str = "", deadline: float | None = None) -> tuple[str, str]:
         mode = self._cfg()["render_mode"]
+        if mode == "plain_text":
+            logger.info(f"[mc_log][{run_id}] 使用纯文本输出模式")
+            return "text", markdown_text
+
         if mode == "html_to_image":
             try:
                 timeout_sec = min(float(self._cfg()["html_render_timeout_sec"]), max(0.1, self.runtime.time_left(deadline)))
@@ -186,18 +190,21 @@ class RenderingAdapter:
                     continue
         return ImageFont.load_default()
 
-    def build_forward_response(self, event, source_name: str, strategy: str, elapsed: float, render_mode: str, render_payload: str):
-        sender_name = self._msg("forward_sender_name")
-        sender_uin = str(event.get_self_id() or "0")
+    def build_summary_text(self, source_name: str, strategy: str, elapsed: float) -> str:
         summary_template = self._msg("summary_template")
         try:
-            summary = summary_template.format(elapsed=elapsed, source_name=source_name, strategy=strategy)
+            return summary_template.format(elapsed=elapsed, source_name=source_name, strategy=strategy)
         except Exception:
-            summary = self._cfg()["messages"]["summary_template"].format(
+            return self._cfg()["messages"]["summary_template"].format(
                 elapsed=elapsed,
                 source_name=source_name,
                 strategy=strategy,
             )
+
+    def build_forward_response(self, event, source_name: str, strategy: str, elapsed: float, render_mode: str, render_payload: str):
+        sender_name = self._msg("forward_sender_name")
+        sender_uin = str(event.get_self_id() or "0")
+        summary = self.build_summary_text(source_name, strategy, elapsed)
         node1 = Comp.Node(content=[Comp.Plain(summary)], name=sender_name, uin=sender_uin)
         if render_mode == "image_url":
             core_content = [Comp.Image.fromURL(render_payload)]

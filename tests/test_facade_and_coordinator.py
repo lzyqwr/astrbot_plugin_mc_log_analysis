@@ -111,6 +111,33 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(actual_path.exists())
         self.assertEqual(actual_path.read_bytes(), b"png")
 
+    async def test_plain_text_render_mode_sends_plain_result(self):
+        log_path = self.case_root / "latest-plain-text.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "[00:10:02] [main/INFO]: Minecraft Version: 1.20.1",
+                    "[00:10:05] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        context = FakeContext(provider_ids={"provider-a"})
+        context.next_llm_text = "纯文本分析结果"
+        plugin = LogAnalyzer(context, {"analyze_select_provider": "provider-a", "render_mode": "plain_text"})
+        plugin.prompt_manager.prompts = {
+            "analyze_system": "z",
+            "analyze_user": "k {{content}}",
+        }
+        plugin.prompt_manager.prompts_ready = True
+        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(log_path))])
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertIsInstance(results[-1].payload, str)
+        self.assertIn("分析完成", results[-1].payload)
+        self.assertIn("纯文本分析结果", results[-1].payload)
+
     async def test_on_message_runs_for_whitelisted_session(self):
         log_path = self.case_root / "latest-whitelist.log"
         log_path.write_text(

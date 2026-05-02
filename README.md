@@ -11,9 +11,10 @@
 - `C` 策略使用本地正则去噪，最大限度保留异常链、版本和模组证据。
 - 内置工具：
   - `search_mc_sites`（聚合搜索 GitHub Issues、Minecraft Forum、Modrinth）
-- 支持两种渲染模式：
+- 支持三种渲染模式：
   - `html_to_image`（模板渲染）
   - `text_to_image`（Pillow）
+  - `plain_text`（纯文本发送，兼容老旧客户端）
 - 输出前自动脱敏（IP、邮箱、路径、token 等）。
 - 默认按“证据优先”输出（结论与步骤均要求证据编号，证据不足时标注 `UNCERTAIN`）。
 - 调试日志落盘前自动脱敏，避免敏感原文持久化。
@@ -59,7 +60,7 @@
 | `metrics_path` | `string` | `audit_metrics.jsonl` | 指标落库文件名（相对 data 目录） |
 | `analyze_select_provider` | `string(select_provider)` | `""` | 最终分析阶段模型提供商（必填） |
 | `session_whitelist` | `list[string]` | `[]` | 会话 ID 白名单；留空表示不限制，非空时仅白名单中的会话会触发插件 |
-| `render_mode` | `string` | `html_to_image` | 渲染模式：`html_to_image` / `text_to_image` |
+| `render_mode` | `string` | `html_to_image` | 渲染模式：`html_to_image` / `text_to_image` / `plain_text` |
 | `image_width` | `int` | `640` | 渲染图片宽度（像素） |
 | `full_read_char_limit` | `int` | `140000` | hs_err/crash 全量读取阈值 |
 | `total_char_limit` | `int` | `140000` | 进入 LLM 的总字符上限 |

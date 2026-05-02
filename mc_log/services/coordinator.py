@@ -328,14 +328,22 @@ class Coordinator:
                                     logger.info(f"[mc_log][{run_id}] 阶段渲染: {time.monotonic() - t_render:.2f}s, mode={render_result.render_mode}")
                                     elapsed = time.monotonic() - started
                                     logger.info(f"[mc_log][{run_id}] 分析完成，总耗时: {elapsed:.2f}s")
-                                    response = self.rendering_adapter.build_forward_response(
-                                        event=event,
-                                        source_name=extraction_result.source_name,
-                                        strategy=extraction_result.strategy,
-                                        elapsed=elapsed,
-                                        render_mode=render_result.render_mode,
-                                        render_payload=render_result.render_payload,
-                                    )
+                                    if render_result.render_mode == "text":
+                                        summary = self.rendering_adapter.build_summary_text(
+                                            source_name=extraction_result.source_name,
+                                            strategy=extraction_result.strategy,
+                                            elapsed=elapsed,
+                                        )
+                                        response = event.plain_result(summary + "\n\n" + render_result.render_payload)
+                                    else:
+                                        response = self.rendering_adapter.build_forward_response(
+                                            event=event,
+                                            source_name=extraction_result.source_name,
+                                            strategy=extraction_result.strategy,
+                                            elapsed=elapsed,
+                                            render_mode=render_result.render_mode,
+                                            render_payload=render_result.render_payload,
+                                        )
                                     response.stop_event()
                                     terminal_result = response
                                     if analysis_result.code_blocks_text:

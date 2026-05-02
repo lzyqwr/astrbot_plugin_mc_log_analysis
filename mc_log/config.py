@@ -146,6 +146,8 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
         cfg["render_mode"] = "html_to_image"
     elif raw_render_mode in {"text", "text_to_image"}:
         cfg["render_mode"] = "text_to_image"
+    elif raw_render_mode in {"plain", "plain_text", "raw_text"}:
+        cfg["render_mode"] = "plain_text"
     else:
         cfg["render_mode"] = "html_to_image"
     messages = normalize_messages_config(cfg.get("messages"))
