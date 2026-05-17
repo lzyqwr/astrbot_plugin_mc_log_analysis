@@ -102,6 +102,20 @@
 
 配置后，只有这些 `session_id` 对应的会话会触发插件；不在白名单中的会话会被静默忽略。
 
+使用 `weixin_oc_hub` 平台时，白名单支持三种写法：
+
+```json
+{
+  "session_whitelist": [
+    "wx_001%remote-user",
+    "remote-user",
+    "weixin_oc_hub:FriendMessage:wx_001%remote-user"
+  ]
+}
+```
+
+`weixin_oc_hub` 会话会强制使用纯文本回复，以兼容 OpenClaw 微信发送端当前支持的消息段。
+
 ## 可自定义提示词与模板
 
 - 最终分析提示词：

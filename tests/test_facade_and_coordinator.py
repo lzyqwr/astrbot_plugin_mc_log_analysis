@@ -4,7 +4,13 @@ import shutil
 import unittest
 from pathlib import Path
 
-from tests.support import DATA_ROOT, FakeContext, FakeEvent, FakeFileComponent, install_astrbot_stubs
+from tests.support import (
+    DATA_ROOT,
+    FakeContext,
+    FakeEvent,
+    FakeFileComponent,
+    install_astrbot_stubs,
+)
 
 install_astrbot_stubs()
 
@@ -36,7 +42,13 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "analyze_user": "k",
         }
         plugin.prompt_manager.prompts_ready = True
-        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(self.case_root / "latest.log"))])
+        event = FakeEvent(
+            messages=[
+                FakeFileComponent(
+                    name="latest.log", source=str(self.case_root / "latest.log")
+                )
+            ]
+        )
         results = await self.collect_results(plugin.on_message(event))
         self.assertEqual(len(results), 1)
         self.assertIn("analyze_select_provider", results[0].payload)
@@ -63,7 +75,9 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "analyze_user": "k {{content}}",
         }
         plugin.prompt_manager.prompts_ready = True
-        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(log_path))])
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))]
+        )
 
         results = await self.collect_results(plugin.on_message(event))
 
@@ -101,7 +115,9 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         plugin.rendering_adapter.html_render_func = fake_html_render
         plugin.rendering_adapter.download_rendered_image = fake_download_rendered_image
-        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(log_path))])
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))]
+        )
 
         results = await self.collect_results(plugin.on_message(event))
 
@@ -124,19 +140,137 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         context = FakeContext(provider_ids={"provider-a"})
         context.next_llm_text = "纯文本分析结果"
-        plugin = LogAnalyzer(context, {"analyze_select_provider": "provider-a", "render_mode": "plain_text"})
+        plugin = LogAnalyzer(
+            context,
+            {"analyze_select_provider": "provider-a", "render_mode": "plain_text"},
+        )
         plugin.prompt_manager.prompts = {
             "analyze_system": "z",
             "analyze_user": "k {{content}}",
         }
         plugin.prompt_manager.prompts_ready = True
-        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(log_path))])
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))]
+        )
 
         results = await self.collect_results(plugin.on_message(event))
 
         self.assertIsInstance(results[-1].payload, str)
         self.assertIn("分析完成", results[-1].payload)
         self.assertIn("纯文本分析结果", results[-1].payload)
+
+    async def test_weixin_oc_hub_forces_plain_text_output(self):
+        log_path = self.case_root / "latest-weixin-hub.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "[00:10:02] [main/INFO]: Minecraft Version: 1.20.1",
+                    "[00:10:05] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        context = FakeContext(provider_ids={"provider-a"})
+        context.next_llm_text = "Hub 纯文本分析结果"
+        plugin = LogAnalyzer(
+            context,
+            {"analyze_select_provider": "provider-a", "render_mode": "html_to_image"},
+        )
+        plugin.prompt_manager.prompts = {
+            "analyze_system": "z",
+            "analyze_user": "k {{content}}",
+        }
+        plugin.prompt_manager.prompts_ready = True
+
+        async def fail_html_render(template, values, options=None):
+            raise AssertionError("weixin_oc_hub should not render HTML output")
+
+        plugin.rendering_adapter.html_render_func = fail_html_render
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))],
+            platform_name="weixin_oc_hub",
+            session_id="wx_001%remote-user",
+        )
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertGreaterEqual(len(results), 2)
+        self.assertIsInstance(results[-1].payload, str)
+        self.assertIn("分析完成", results[-1].payload)
+        self.assertIn("Hub 纯文本分析结果", results[-1].payload)
+        self.assertFalse(hasattr(results[-1].payload, "nodes"))
+
+    async def test_weixin_oc_hub_whitelist_matches_remote_user(self):
+        log_path = self.case_root / "latest-hub-remote-whitelist.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "[00:10:02] [main/INFO]: Minecraft Version: 1.20.1",
+                    "[00:10:05] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        context = FakeContext(provider_ids={"provider-a"})
+        plugin = LogAnalyzer(
+            context,
+            {
+                "analyze_select_provider": "provider-a",
+                "session_whitelist": ["remote-user"],
+            },
+        )
+        plugin.prompt_manager.prompts = {
+            "analyze_system": "z",
+            "analyze_user": "k {{content}}",
+        }
+        plugin.prompt_manager.prompts_ready = True
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))],
+            platform_name="weixin_oc_hub",
+            session_id="wx_001%remote-user",
+        )
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertGreaterEqual(len(results), 2)
+        self.assertIn("正在分析", results[0].payload)
+
+    async def test_weixin_oc_hub_whitelist_matches_unified_origin(self):
+        log_path = self.case_root / "latest-hub-unified-whitelist.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "[00:10:02] [main/INFO]: Minecraft Version: 1.20.1",
+                    "[00:10:05] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        unified_origin = "weixin_oc_hub:FriendMessage:wx_001%remote-user"
+        context = FakeContext(provider_ids={"provider-a"})
+        plugin = LogAnalyzer(
+            context,
+            {
+                "analyze_select_provider": "provider-a",
+                "session_whitelist": [unified_origin],
+            },
+        )
+        plugin.prompt_manager.prompts = {
+            "analyze_system": "z",
+            "analyze_user": "k {{content}}",
+        }
+        plugin.prompt_manager.prompts_ready = True
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))],
+            platform_name="weixin_oc_hub",
+            session_id="wx_001%remote-user",
+            unified_msg_origin=unified_origin,
+        )
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertGreaterEqual(len(results), 2)
+        self.assertIn("正在分析", results[0].payload)
 
     async def test_on_message_runs_for_whitelisted_session(self):
         log_path = self.case_root / "latest-whitelist.log"
@@ -153,14 +287,20 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         context = FakeContext(provider_ids={"provider-a"})
         plugin = LogAnalyzer(
             context,
-            {"analyze_select_provider": "provider-a", "session_whitelist": ["session-1", "session-2"]},
+            {
+                "analyze_select_provider": "provider-a",
+                "session_whitelist": ["session-1", "session-2"],
+            },
         )
         plugin.prompt_manager.prompts = {
             "analyze_system": "z",
             "analyze_user": "k {{content}}",
         }
         plugin.prompt_manager.prompts_ready = True
-        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(log_path))], session_id="session-2")
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))],
+            session_id="session-2",
+        )
 
         results = await self.collect_results(plugin.on_message(event))
 
@@ -172,7 +312,11 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         plugin = LogAnalyzer(FakeContext(), {"session_whitelist": ["session-allow"]})
         plugin.prompt_manager.prompts_ready = False
         event = FakeEvent(
-            messages=[FakeFileComponent(name="latest.log", source=str(self.case_root / "latest.log"))],
+            messages=[
+                FakeFileComponent(
+                    name="latest.log", source=str(self.case_root / "latest.log")
+                )
+            ],
             session_id="session-blocked",
         )
 
@@ -183,8 +327,16 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_on_message_prompt_missing(self):
         plugin = LogAnalyzer(FakeContext(), {})
         plugin.prompt_manager.prompts_ready = False
-        plugin.prompt_manager.load_prompts = lambda: setattr(plugin.prompt_manager, "prompts_ready", False)
-        event = FakeEvent(messages=[FakeFileComponent(name="latest.log", source=str(self.case_root / "latest.log"))])
+        plugin.prompt_manager.load_prompts = lambda: setattr(
+            plugin.prompt_manager, "prompts_ready", False
+        )
+        event = FakeEvent(
+            messages=[
+                FakeFileComponent(
+                    name="latest.log", source=str(self.case_root / "latest.log")
+                )
+            ]
+        )
         results = await self.collect_results(plugin.on_message(event))
         self.assertEqual(len(results), 1)
         self.assertIn("模板缺失", results[0].payload)

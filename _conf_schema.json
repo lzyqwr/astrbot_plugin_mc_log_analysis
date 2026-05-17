@@ -13,7 +13,7 @@
       "type": "string"
     },
     "default": [],
-    "hint": "留空表示所有会话都可触发；仅填写的 session_id 会生效。"
+    "hint": "留空表示所有会话都可触发；Weixin OC Hub 可填写完整 session_id（wx_001%user）、原始用户 ID（user）或统一来源（weixin_oc_hub:FriendMessage:wx_001%user）。"
   },
   "render_mode": {
     "description": "输出设置 / 渲染模式",

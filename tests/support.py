@@ -228,24 +228,36 @@ class FakeEvent:
         session_id="session-1",
         platform_name="test",
         self_id="bot-1",
+        unified_msg_origin="",
     ):
         self._messages = list(messages or [])
-        self.message_obj = FakeMessageObj(message_id=message_id, raw_message=raw_message)
+        self.message_obj = FakeMessageObj(
+            message_id=message_id, raw_message=raw_message
+        )
         self._sender_id = sender_id
         self._sender_name = sender_name
         self._group_id = group_id
         self._session_id = session_id
         self._platform_name = platform_name
         self._self_id = self_id
+        self.unified_msg_origin = unified_msg_origin
 
     def get_messages(self):
         return list(self._messages)
 
     def plain_result(self, text):
-        return SimpleNamespace(payload=text, stopped=False, stop_event=lambda: setattr(self, "_stopped", True))
+        return SimpleNamespace(
+            payload=text,
+            stopped=False,
+            stop_event=lambda: setattr(self, "_stopped", True),
+        )
 
     def chain_result(self, payload):
-        return SimpleNamespace(payload=payload, stopped=False, stop_event=lambda: setattr(self, "_stopped", True))
+        return SimpleNamespace(
+            payload=payload,
+            stopped=False,
+            stop_event=lambda: setattr(self, "_stopped", True),
+        )
 
     def get_sender_id(self):
         return self._sender_id

@@ -21,6 +21,10 @@ from mc_log.domain.detection import (
 from mc_log.domain.extraction import ExtractionDomain
 from mc_log.domain.metrics import MetricsService
 from mc_log.domain.privacy import PrivacyService
+from mc_log.platform_compat import (
+    session_whitelist_candidates,
+    should_force_plain_text_output,
+)
 from mc_log.prompts import PromptManager
 from mc_log.runtime import PluginRuntime
 from tests.support import DATA_ROOT
@@ -32,7 +36,13 @@ class DomainLogicTests(unittest.TestCase):
             {
                 "render_mode": "text",
                 "read_archive_file_limit": -2,
-                "session_whitelist": [" session-1 ", "", "session-2", "session-1", None],
+                "session_whitelist": [
+                    " session-1 ",
+                    "",
+                    "session-2",
+                    "session-1",
+                    None,
+                ],
                 "messages": {"accepted_notice": "ok"},
             }
         ).get()
@@ -42,11 +52,36 @@ class DomainLogicTests(unittest.TestCase):
         self.assertEqual(cfg.msg("accepted_notice"), "ok")
         self.assertNotIn("map_select_provider", cfg.to_dict())
         self.assertNotIn("chunk_size", cfg.to_dict())
-        self.assertEqual(cfg.msg("provider_not_configured"), "请先在插件配置中填写 analyze_select_provider。")
+        self.assertEqual(
+            cfg.msg("provider_not_configured"),
+            "请先在插件配置中填写 analyze_select_provider。",
+        )
 
     def test_config_missing_session_whitelist_defaults_to_empty_list(self):
         cfg = ConfigManager({}).get()
         self.assertEqual(cfg["session_whitelist"], [])
+
+    def test_weixin_oc_hub_session_candidates(self):
+        event = FakeEvent(
+            platform_name="weixin_oc_hub",
+            session_id="wx_001%remote-user",
+            unified_msg_origin="weixin_oc_hub:FriendMessage:wx_001%remote-user",
+        )
+
+        candidates = session_whitelist_candidates(event)
+
+        self.assertTrue(should_force_plain_text_output(event))
+        self.assertIn("wx_001%remote-user", candidates)
+        self.assertIn("remote-user", candidates)
+        self.assertIn("weixin_oc_hub:FriendMessage:wx_001%remote-user", candidates)
+
+    def test_non_hub_session_candidates_only_include_session(self):
+        event = FakeEvent(platform_name="test", session_id="wx_001%remote-user")
+
+        candidates = session_whitelist_candidates(event)
+
+        self.assertFalse(should_force_plain_text_output(event))
+        self.assertEqual(candidates, {"wx_001%remote-user"})
 
     def test_prompt_manager_only_requires_analyze_prompts(self):
         prompt_dir = DATA_ROOT / "prompt_only_analyze"
@@ -65,7 +100,9 @@ class DomainLogicTests(unittest.TestCase):
         file_comp = FakeFileComponent(name="", source="")
         event = FakeEvent(
             messages=[file_comp],
-            raw_message={"message": [{"type": "file", "data": {"file_name": "latest.log"}}]},
+            raw_message={
+                "message": [{"type": "file", "data": {"file_name": "latest.log"}}]
+            },
         )
         self.assertEqual(detect_file_name(event, file_comp), "latest.log")
         selected = pick_target_file(event)
@@ -83,7 +120,9 @@ class DomainLogicTests(unittest.TestCase):
         self.assertEqual(err, "")
 
         privacy = PrivacyService()
-        redacted = privacy.redact_text("C:\\Users\\abc\\mods connect 192.168.1.2 api_key=abc12345678901234567")
+        redacted = privacy.redact_text(
+            "C:\\Users\\abc\\mods connect 192.168.1.2 api_key=abc12345678901234567"
+        )
         self.assertIn("<PATH>", redacted)
         self.assertIn("<LAN_IP>", redacted)
         self.assertIn("<TOKEN>", redacted)
@@ -126,7 +165,13 @@ class DomainLogicTests(unittest.TestCase):
         self.assertGreaterEqual(redacted.count("<TOKEN>"), 3)
 
     def test_extraction_budget_and_tool_sanitize(self):
-        config_manager = ConfigManager({"must_keep_window_lines": 2, "total_char_limit": 120, "tool_snippet_chars": 80})
+        config_manager = ConfigManager(
+            {
+                "must_keep_window_lines": 2,
+                "total_char_limit": 120,
+                "tool_snippet_chars": 80,
+            }
+        )
         extraction = ExtractionDomain(config_manager.get)
         content = "\n".join(
             [
@@ -143,7 +188,9 @@ class DomainLogicTests(unittest.TestCase):
         self.assertEqual(extraction.strategy_from_text_name("latest.log"), "C")
 
         adapter = HttpToolAdapter(config_manager, PrivacyService())
-        sanitized = adapter.tool_response_sanitize("please download token=abc12345678901234567", "mcmod")
+        sanitized = adapter.tool_response_sanitize(
+            "please download token=abc12345678901234567", "mcmod"
+        )
         self.assertIn("[tool:mcmod]", sanitized)
         self.assertIn("untrusted_instruction", sanitized)
 
@@ -184,9 +231,14 @@ class DomainLogicTests(unittest.TestCase):
         self.assertEqual(result, text)
 
     def test_strategy_c_regex_filter_preserves_key_info(self):
-        config_manager = ConfigManager({"must_keep_window_lines": 2, "total_char_limit": 12000})
+        config_manager = ConfigManager(
+            {"must_keep_window_lines": 2, "total_char_limit": 12000}
+        )
         extraction = ExtractionDomain(config_manager.get)
-        lines = [f"[00:00:{idx:02d}] [Render thread/INFO]: bootstrap line {idx}" for idx in range(220)]
+        lines = [
+            f"[00:00:{idx:02d}] [Render thread/INFO]: bootstrap line {idx}"
+            for idx in range(220)
+        ]
         lines.extend(
             [
                 "[00:10:01] [Render thread/INFO]: Loaded sound event should_drop",
@@ -200,14 +252,19 @@ class DomainLogicTests(unittest.TestCase):
                 "[00:10:06] [main/ERROR]: Crash report saved to /tmp/crash-1.txt",
             ]
         )
-        lines.extend(f"[00:20:{idx:02d}] [Worker-1/INFO]: steady state line {idx}" for idx in range(220))
+        lines.extend(
+            f"[00:20:{idx:02d}] [Worker-1/INFO]: steady state line {idx}"
+            for idx in range(220)
+        )
         content = "\n".join(lines)
 
         async def fake_reader(path: Path, deadline=None):
             return content
 
         reduced = extraction.build_strategy_c_regex_text(content)
-        result = asyncio.run(extraction.strategy_c_extract(Path("latest.log"), fake_reader))
+        result = asyncio.run(
+            extraction.strategy_c_extract(Path("latest.log"), fake_reader)
+        )
 
         self.assertNotIn("Loaded sound event should_drop", reduced)
         self.assertIn("Minecraft Version: 1.20.1", result)
@@ -219,14 +276,21 @@ class DomainLogicTests(unittest.TestCase):
         self.assertIn("...[中间内容已省略]...", result)
 
     def test_strategy_c_regex_filter_falls_back_when_no_key_hits(self):
-        config_manager = ConfigManager({"must_keep_window_lines": 2, "total_char_limit": 20000})
+        config_manager = ConfigManager(
+            {"must_keep_window_lines": 2, "total_char_limit": 20000}
+        )
         extraction = ExtractionDomain(config_manager.get)
-        content = "\n".join(f"[00:30:{idx:02d}] [Server thread/INFO]: heartbeat {idx}" for idx in range(420))
+        content = "\n".join(
+            f"[00:30:{idx:02d}] [Server thread/INFO]: heartbeat {idx}"
+            for idx in range(420)
+        )
 
         async def fake_reader(path: Path, deadline=None):
             return content
 
-        result = asyncio.run(extraction.strategy_c_extract(Path("latest.log"), fake_reader))
+        result = asyncio.run(
+            extraction.strategy_c_extract(Path("latest.log"), fake_reader)
+        )
         expected = extraction.apply_budget_with_must_keep(
             extraction.build_error_focused_text(content),
             content,
@@ -251,10 +315,14 @@ class DomainLogicTests(unittest.TestCase):
         )
         path.write_bytes(content.encode("gb18030"))
 
-        config_manager = ConfigManager({"must_keep_window_lines": 2, "total_char_limit": 20000})
+        config_manager = ConfigManager(
+            {"must_keep_window_lines": 2, "total_char_limit": 20000}
+        )
         extraction = ExtractionDomain(config_manager.get)
         adapter = FileAdapter(config_manager, PluginRuntime())
-        result = asyncio.run(extraction.strategy_c_extract(path, adapter.read_text_with_fallback))
+        result = asyncio.run(
+            extraction.strategy_c_extract(path, adapter.read_text_with_fallback)
+        )
 
         self.assertIn("75服务端启动异常", result)
         self.assertIn("缺少依赖", result)
@@ -277,11 +345,16 @@ class DomainLogicTests(unittest.TestCase):
         adapter = FileAdapter(ConfigManager({}), PluginRuntime())
         extracted = asyncio.run(adapter.safe_extract_zip(zip_path, out_dir))
 
-        self.assertEqual([path.relative_to(out_dir).as_posix() for path in extracted], ["logs/latest.log"])
+        self.assertEqual(
+            [path.relative_to(out_dir).as_posix() for path in extracted],
+            ["logs/latest.log"],
+        )
         self.assertTrue((out_dir / "logs" / "latest.log").exists())
         self.assertFalse((case_root / "out_evil" / "pwn.txt").exists())
         self.assertFalse((case_root / "escape.txt").exists())
-        self.assertFalse(any(path.name == "evil.txt" for path in case_root.rglob("evil.txt")))
+        self.assertFalse(
+            any(path.name == "evil.txt" for path in case_root.rglob("evil.txt"))
+        )
         self.assertFalse((out_dir / "abs.txt").exists())
 
 
