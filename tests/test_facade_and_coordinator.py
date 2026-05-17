@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import shutil
 import unittest
 from pathlib import Path
@@ -271,6 +273,86 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(len(results), 2)
         self.assertIn("正在分析", results[0].payload)
+
+    async def test_blacklist_mode_ignores_blocked_session(self):
+        plugin = LogAnalyzer(
+            FakeContext(),
+            {
+                "session_filter_mode": "blacklist",
+                "session_blacklist": ["session-blocked"],
+            },
+        )
+        plugin.prompt_manager.prompts_ready = False
+        event = FakeEvent(
+            messages=[
+                FakeFileComponent(
+                    name="latest.log", source=str(self.case_root / "latest.log")
+                )
+            ],
+            session_id="session-blocked",
+        )
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertEqual(results, [])
+
+    async def test_blacklist_mode_allows_unlisted_session(self):
+        log_path = self.case_root / "latest-blacklist-allowed.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "[00:10:02] [main/INFO]: Minecraft Version: 1.20.1",
+                    "[00:10:05] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        context = FakeContext(provider_ids={"provider-a"})
+        plugin = LogAnalyzer(
+            context,
+            {
+                "analyze_select_provider": "provider-a",
+                "session_filter_mode": "blacklist",
+                "session_blacklist": ["session-blocked"],
+            },
+        )
+        plugin.prompt_manager.prompts = {
+            "analyze_system": "z",
+            "analyze_user": "k {{content}}",
+        }
+        plugin.prompt_manager.prompts_ready = True
+        event = FakeEvent(
+            messages=[FakeFileComponent(name="latest.log", source=str(log_path))],
+            session_id="session-allowed",
+        )
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertGreaterEqual(len(results), 2)
+        self.assertIn("正在分析", results[0].payload)
+
+    async def test_weixin_oc_hub_blacklist_matches_remote_user(self):
+        plugin = LogAnalyzer(
+            FakeContext(),
+            {
+                "session_filter_mode": "blacklist",
+                "session_blacklist": ["remote-user"],
+            },
+        )
+        plugin.prompt_manager.prompts_ready = False
+        event = FakeEvent(
+            messages=[
+                FakeFileComponent(
+                    name="latest.log", source=str(self.case_root / "latest.log")
+                )
+            ],
+            platform_name="weixin_oc_hub",
+            session_id="wx_001%remote-user",
+        )
+
+        results = await self.collect_results(plugin.on_message(event))
+
+        self.assertEqual(results, [])
 
     async def test_on_message_runs_for_whitelisted_session(self):
         log_path = self.case_root / "latest-whitelist.log"

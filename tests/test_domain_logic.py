@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import asyncio
 import shutil
 import unittest
@@ -36,6 +38,7 @@ class DomainLogicTests(unittest.TestCase):
             {
                 "render_mode": "text",
                 "read_archive_file_limit": -2,
+                "session_filter_mode": "blocklist",
                 "session_whitelist": [
                     " session-1 ",
                     "",
@@ -43,12 +46,15 @@ class DomainLogicTests(unittest.TestCase):
                     "session-1",
                     None,
                 ],
+                "session_blacklist": [" bad-session ", "", "bad-session", None],
                 "messages": {"accepted_notice": "ok"},
             }
         ).get()
         self.assertEqual(cfg["render_mode"], "text_to_image")
         self.assertEqual(cfg["read_archive_file_limit"], 0)
+        self.assertEqual(cfg["session_filter_mode"], "blacklist")
         self.assertEqual(cfg["session_whitelist"], ["session-1", "session-2"])
+        self.assertEqual(cfg["session_blacklist"], ["bad-session"])
         self.assertEqual(cfg.msg("accepted_notice"), "ok")
         self.assertNotIn("map_select_provider", cfg.to_dict())
         self.assertNotIn("chunk_size", cfg.to_dict())
@@ -59,7 +65,9 @@ class DomainLogicTests(unittest.TestCase):
 
     def test_config_missing_session_whitelist_defaults_to_empty_list(self):
         cfg = ConfigManager({}).get()
+        self.assertEqual(cfg["session_filter_mode"], "whitelist")
         self.assertEqual(cfg["session_whitelist"], [])
+        self.assertEqual(cfg["session_blacklist"], [])
 
     def test_weixin_oc_hub_session_candidates(self):
         event = FakeEvent(

@@ -59,12 +59,20 @@ class Coordinator:
     def configured_analyze_provider_id(self) -> str:
         return str(self._cfg().get("analyze_select_provider", "") or "").strip()
 
-    def is_session_whitelisted(self, event, cfg) -> bool:
+    def is_session_allowed(self, event, cfg) -> bool:
+        candidates = session_whitelist_candidates(event)
+        filter_mode = str(cfg.get("session_filter_mode", "whitelist") or "").strip()
+        if filter_mode == "blacklist":
+            blacklist = cfg.get("session_blacklist", [])
+            return not any(session_id in blacklist for session_id in candidates)
+
         whitelist = cfg.get("session_whitelist", [])
         if not whitelist:
             return True
-        candidates = session_whitelist_candidates(event)
         return any(session_id in whitelist for session_id in candidates)
+
+    def is_session_whitelisted(self, event, cfg) -> bool:
+        return self.is_session_allowed(event, cfg)
 
     async def write_metrics(self, data: dict):
         if not self._cfg().get("metrics_enabled", True):
@@ -203,9 +211,10 @@ class Coordinator:
         if not selected:
             return
 
-        if not self.is_session_whitelisted(event, cfg):
+        if not self.is_session_allowed(event, cfg):
             logger.info(
-                f"[mc_log] 会话未命中白名单，已忽略: session_id={event.get_session_id()!r}"
+                f"[mc_log] 会话被过滤规则忽略: mode={cfg.get('session_filter_mode')!r}, "
+                f"session_id={event.get_session_id()!r}"
             )
             return
 

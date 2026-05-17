@@ -59,7 +59,9 @@
 | `metrics_enabled` | `bool` | `true` | 是否启用结构化指标落库 |
 | `metrics_path` | `string` | `audit_metrics.jsonl` | 指标落库文件名（相对 data 目录） |
 | `analyze_select_provider` | `string(select_provider)` | `""` | 最终分析阶段模型提供商（必填） |
-| `session_whitelist` | `list[string]` | `[]` | 会话 ID 白名单；留空表示不限制，非空时仅白名单中的会话会触发插件 |
+| `session_filter_mode` | `string` | `whitelist` | 会话过滤模式：`whitelist` / `blacklist` |
+| `session_whitelist` | `list[string]` | `[]` | 白名单模式生效；留空表示不限制，非空时仅白名单中的会话会触发插件 |
+| `session_blacklist` | `list[string]` | `[]` | 黑名单模式生效；命中的会话会被静默忽略，其余会话可触发插件 |
 | `render_mode` | `string` | `html_to_image` | 渲染模式：`html_to_image` / `text_to_image` / `plain_text` |
 | `image_width` | `int` | `640` | 渲染图片宽度（像素） |
 | `full_read_char_limit` | `int` | `140000` | hs_err/crash 全量读取阈值 |
@@ -92,15 +94,27 @@
 
 完整配置字段见：`_conf_schema.json`
 
-`session_whitelist` 示例：
+白名单模式示例：
 
 ```json
 {
+  "session_filter_mode": "whitelist",
   "session_whitelist": ["session-1", "session-2"]
 }
 ```
 
 配置后，只有这些 `session_id` 对应的会话会触发插件；不在白名单中的会话会被静默忽略。
+
+黑名单模式示例：
+
+```json
+{
+  "session_filter_mode": "blacklist",
+  "session_blacklist": ["session-1", "session-2"]
+}
+```
+
+配置后，黑名单中的会话会被静默忽略；其他会话仍可触发插件。
 
 使用 `weixin_oc_hub` 平台时，白名单支持三种写法：
 
@@ -113,6 +127,8 @@
   ]
 }
 ```
+
+黑名单同样支持这三种写法。
 
 `weixin_oc_hub` 会话会强制使用纯文本回复，以兼容 OpenClaw 微信发送端当前支持的消息段。
 

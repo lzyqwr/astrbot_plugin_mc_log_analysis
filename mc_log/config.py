@@ -21,7 +21,9 @@ DEFAULT_CONFIG = {
     "metrics_enabled": True,
     "metrics_path": "audit_metrics.jsonl",
     "analyze_select_provider": "",
+    "session_filter_mode": "whitelist",
     "session_whitelist": [],
+    "session_blacklist": [],
     "render_mode": "html_to_image",
     "image_width": 640,
     "full_read_char_limit": 140000,
@@ -104,6 +106,13 @@ def normalize_string_list_config(raw_values: Any) -> list[str]:
     return out
 
 
+def normalize_session_filter_mode(raw_value: Any) -> str:
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in {"blacklist", "blocklist", "denylist", "black"}:
+        return "blacklist"
+    return "whitelist"
+
+
 def load_plugin_config(raw_config: Any) -> PluginConfig:
     cfg = dict(DEFAULT_CONFIG)
     for key in cfg:
@@ -113,7 +122,9 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
     cfg["queue_wait_sec"] = max(0, int(cfg.get("queue_wait_sec", 8)))
     cfg["max_concurrent_jobs"] = max(1, int(cfg.get("max_concurrent_jobs", 2)))
     cfg["max_concurrent_io"] = max(1, int(cfg.get("max_concurrent_io", 1)))
-    cfg["max_input_file_bytes"] = max(1024 * 1024, int(cfg.get("max_input_file_bytes", 32 * 1024 * 1024)))
+    cfg["max_input_file_bytes"] = max(
+        1024 * 1024, int(cfg.get("max_input_file_bytes", 32 * 1024 * 1024))
+    )
     cfg["max_archive_file_count"] = max(1, int(cfg.get("max_archive_file_count", 160)))
     cfg["max_archive_single_file_bytes"] = max(
         1024 * 1024, int(cfg.get("max_archive_single_file_bytes", 12 * 1024 * 1024))
@@ -122,13 +133,27 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
         cfg["max_archive_single_file_bytes"],
         int(cfg.get("max_archive_total_bytes", 32 * 1024 * 1024)),
     )
-    cfg["max_gz_output_bytes"] = max(1024 * 1024, int(cfg.get("max_gz_output_bytes", 16 * 1024 * 1024)))
+    cfg["max_gz_output_bytes"] = max(
+        1024 * 1024, int(cfg.get("max_gz_output_bytes", 16 * 1024 * 1024))
+    )
     cfg["must_keep_window_lines"] = max(5, int(cfg.get("must_keep_window_lines", 30)))
     cfg["diag_version"] = str(cfg.get("diag_version", "1.0.0") or "1.0.0")
     cfg["metrics_enabled"] = bool(cfg.get("metrics_enabled", True))
-    cfg["metrics_path"] = str(cfg.get("metrics_path", "audit_metrics.jsonl") or "audit_metrics.jsonl")
-    cfg["analyze_select_provider"] = str(cfg.get("analyze_select_provider", "") or "").strip()
-    cfg["session_whitelist"] = normalize_string_list_config(cfg.get("session_whitelist"))
+    cfg["metrics_path"] = str(
+        cfg.get("metrics_path", "audit_metrics.jsonl") or "audit_metrics.jsonl"
+    )
+    cfg["analyze_select_provider"] = str(
+        cfg.get("analyze_select_provider", "") or ""
+    ).strip()
+    cfg["session_filter_mode"] = normalize_session_filter_mode(
+        cfg.get("session_filter_mode")
+    )
+    cfg["session_whitelist"] = normalize_string_list_config(
+        cfg.get("session_whitelist")
+    )
+    cfg["session_blacklist"] = normalize_string_list_config(
+        cfg.get("session_blacklist")
+    )
     cfg["image_width"] = max(320, int(cfg.get("image_width", 640)))
     cfg["full_read_char_limit"] = max(10000, int(cfg["full_read_char_limit"]))
     cfg["total_char_limit"] = max(3000, int(cfg["total_char_limit"]))
