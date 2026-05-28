@@ -157,7 +157,11 @@ class Coordinator:
         archive_file_map = self.extraction_domain.build_archive_file_map(
             extracted_paths, extract_root
         )
-        selected = self.extraction_domain.pick_priority_file(extracted_paths)
+        selected = await self.extraction_domain.pick_priority_file(
+            extracted_paths,
+            self.file_adapter.read_text_with_fallback,
+            deadline=deadline,
+        )
         if not selected:
             raise RuntimeError("archive has no matching log file")
         logger.info(f"[mc_log][{run_id}] 归档内选中文件: {selected.name}")
@@ -176,6 +180,18 @@ class Coordinator:
     ) -> tuple[str, str]:
         name_lower = path.name.lower()
         strategy = self.extraction_domain.strategy_from_text_name(name_lower)
+        if strategy == "B" and "debug" not in name_lower:
+            try:
+                peek_content = await self.file_adapter.read_text_with_fallback(
+                    path, deadline=deadline
+                )
+                strategy = self.extraction_domain.strategy_from_name_and_peek(
+                    name_lower, peek_content
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[mc_log][{run_id}] 文本文件内容嗅探失败，沿用文件名策略: file={path.name}, error={exc}"
+                )
         logger.info(
             f"[mc_log][{run_id}] 文本文件策略判定: file={path.name}, strategy={strategy}"
         )
