@@ -8,7 +8,7 @@
 - 支持压缩包：`.zip`、`.gz`。
 - 支持文本日志：`.txt`、`.log`。
 - 三种提取策略（A/B/C）自动选择，避免把整份原始日志全量喂给模型。
-- `C` 策略使用本地正则去噪，最大限度保留异常链、版本和模组证据。
+- `C` 策略使用前缀感知、块感知的本地正则去噪，最大限度保留异常链、版本、模组依赖与加载器诊断证据。
 - 内置工具：
   - `search_mc_sites`（聚合搜索 GitHub Issues、Minecraft Forum、Modrinth）
 - 支持三种渲染模式：
@@ -22,6 +22,16 @@
 - 输出的“解决步骤”默认要求：可逆性提醒、风险等级（低/中/高）与端区分（Client/Server/Both），并按低→高风险排序。
 - 工具失败或超时时，仍会基于日志证据继续分析，并明确提示工具不可用/未搜到。
 - 聚合搜索工具会先做跨站点去重，避免同一线索重复出现。
+
+## 日志提取策略
+
+插件会按文件名和内容自动选择提取策略：
+
+- `A`：`crash` / `hs_err` 等崩溃报告，优先保留 crash report 关键段落。
+- `B`：普通 `debug` / 大型泛日志，保留头尾和错误窗口。
+- `C`：`latest`、`fcl`、`pcl`、游戏崩溃报告、launcher run output 等完整运行日志。
+
+`C` 策略会解析日志前缀中的线程与级别，识别 Fabric 依赖块、Forge/NeoForge mod-loading issue、entrypoint/classloading/Mixin、datapack、shader/reload 等常见根因块，并对用户目录、IP 和控制字符做最终清理。
 
 ## 触发规则
 
@@ -139,6 +149,14 @@
   - `assets/analyze_user.txt`
 - HTML 渲染模板：
   - `assets/html_to_image.html.j2`
+
+## 回归评估
+
+Strategy C 的抽取质量可用 JSONL gold cases 做离线评估。样例位于：
+
+- `tests/fixtures/strategy_c_gold_cases.jsonl`
+
+评估工具位于 `mc_log/domain/extraction_eval.py`，会输出 root/support/culprit recall、noise leak、case success rate，并按 loader/kind 分组汇总。
 
 ## 返回内容
 
