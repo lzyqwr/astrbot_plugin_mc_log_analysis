@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 ARCHIVE_EXTS = {".zip", ".gz"}
 TEXT_EXTS = {".txt", ".log"}
-ARCHIVE_NAME_KEYS = ("错误报告", "日志", "log")
+ARCHIVE_NAME_KEYS = ("错误报告", "clash", "crash", "日志", "log")
 TEXT_NAME_KEYS = ("crash", "hs_err", "latest", "debug", "fcl", "pcl", "游戏崩溃", "日志", "log")
 
 

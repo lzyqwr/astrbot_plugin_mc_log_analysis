@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import aiohttp
 from astrbot.api import logger
+
+
+ANALYZE_SECTION_ORDER = ("核心问题", "关键证据", "解决步骤", "补充确认")
+NETWORK_SEARCH_NOTICE = "请注意，以下部分信息来源于网络搜索，仅供参考，请谨慎判断其准确性。"
 
 
 class AnalysisService:
@@ -147,6 +152,111 @@ class AnalysisService:
         )
         return False, "empty_text_parts"
 
+    def match_analyze_section_heading(self, line: str) -> tuple[str, str] | None:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return None
+        stripped = re.sub(r"^\s{0,3}#{1,6}\s*", "", stripped)
+        stripped = stripped.replace("**", "").strip("`_ \t")
+        pattern = "|".join(re.escape(title) for title in ANALYZE_SECTION_ORDER)
+        match = re.match(rf"^({pattern})\s*(?:[:：]\s*(.*))?$", stripped)
+        if not match:
+            return None
+        return match.group(1), (match.group(2) or "").strip()
+
+    def looks_like_extra_heading(self, line: str) -> bool:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return False
+        if re.match(r"^\s{0,3}#{1,6}\s+\S+", stripped):
+            return True
+        stripped = stripped.replace("**", "").strip("`_ \t")
+        if self.match_analyze_section_heading(stripped):
+            return False
+        if re.match(r"^[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9 _/（）()【】\-]{1,24}\s*[:：]\s*$", stripped):
+            return True
+        return bool(
+            re.match(
+                r"^(?:免责声明|额外说明|补充说明|注意事项|更多建议|总结|结论|分析过程|补充约束)\s*[:：]",
+                stripped,
+                re.I,
+            )
+        )
+
+    def cap_section_lines(self, title: str, lines: list[str]) -> list[str]:
+        cleaned = [line.rstrip() for line in lines]
+        while cleaned and not cleaned[0].strip():
+            cleaned.pop(0)
+        while cleaned and not cleaned[-1].strip():
+            cleaned.pop()
+
+        if title == "核心问题":
+            for line in cleaned:
+                if line.strip():
+                    return [line.strip()]
+            return []
+
+        limit = 4 if title in ("关键证据", "解决步骤", "补充确认") else 8
+        kept: list[str] = []
+        non_empty = 0
+        for line in cleaned:
+            if not line.strip():
+                if kept and kept[-1].strip():
+                    kept.append("")
+                continue
+            non_empty += 1
+            if non_empty > limit:
+                break
+            kept.append(line.strip())
+        while kept and not kept[-1].strip():
+            kept.pop()
+        return kept
+
+    def normalize_analyze_output(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        has_network_notice = any("网络搜索" in line and "仅供参考" in line for line in lines)
+        sections = {title: [] for title in ANALYZE_SECTION_ORDER}
+        current: str | None = None
+        found_section = False
+
+        for line in lines:
+            if line.strip().startswith("```"):
+                continue
+            matched = self.match_analyze_section_heading(line)
+            if matched:
+                current, inline_content = matched
+                found_section = True
+                if inline_content:
+                    sections[current].append(inline_content)
+                continue
+            if not found_section:
+                continue
+            if self.looks_like_extra_heading(line):
+                current = None
+                continue
+            if current:
+                if "网络搜索" in line and "仅供参考" in line:
+                    continue
+                sections[current].append(line)
+
+        if not found_section:
+            return raw
+
+        blocks: list[str] = []
+        for title in ANALYZE_SECTION_ORDER:
+            blocks.append(f"{title}：")
+            blocks.extend(self.cap_section_lines(title, sections[title]))
+            blocks.append("")
+        if has_network_notice:
+            blocks.append(NETWORK_SEARCH_NOTICE)
+
+        normalized = "\n".join(blocks).strip()
+        return normalized or raw
+
     async def analyze_with_llm(
         self,
         event,
@@ -278,6 +388,10 @@ class AnalysisService:
                             text = fb_text
                     except Exception as fb_exc:
                         logger.warning(f"[mc_log][{run_id}] 疑似异常占位文本重试失败，保留原结果: {fb_exc}")
+                normalized_text = self.normalize_analyze_output(text)
+                if normalized_text != text:
+                    logger.info(f"[mc_log][{run_id}] 最终分析输出已按固定结构裁剪: before={len(text)}, after={len(normalized_text)}")
+                    text = normalized_text
                 logger.info(f"[mc_log][{run_id}] 最终分析返回: chars={len(text)}")
                 if tool_failed:
                     logger.info(f"[mc_log][{run_id}] 工具失败降级原因: {tool_failure_reason}")

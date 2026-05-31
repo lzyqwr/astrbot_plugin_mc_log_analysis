@@ -16,7 +16,7 @@ from mc_log.config import ConfigManager
 from mc_log.domain.metrics import MetricsService
 from mc_log.domain.privacy import PrivacyService
 from mc_log.runtime import PluginRuntime
-from mc_log.services.analysis import AnalysisService
+from mc_log.services.analysis import AnalysisService, NETWORK_SEARCH_NOTICE
 from mc_log.services.tool_registry import ToolRegistry
 
 
@@ -91,6 +91,65 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "分析结果")
         self.assertEqual(captured["tools"], ["search_mc_sites", "read_archive_file"])
+
+    async def test_analysis_trims_model_added_sections(self):
+        self.registry.register_tools()
+        self.context.next_llm_text = "\n".join(
+            [
+                "好的，我来分析。",
+                "",
+                "### 核心问题：缺少 Fabric API 导致启动失败",
+                "",
+                "关键证据：",
+                "- E1: ClassNotFoundException: net.fabricmc.fabric.api.event.Event",
+                "- E2: Mod foo requires fabric-api",
+                "- E3: Loading Minecraft 1.20.1",
+                "- E4: Fabric Loader 0.15.11",
+                "- E5: 这条应该被裁剪",
+                "",
+                "解决步骤：",
+                "1. 安装匹配版本 Fabric API；依据：E1/E2；可逆：先备份 mods [风险：低] [端：Both]",
+                "2. 核对 MC/Loader/模组版本；依据：E3/E4；可逆：记录原版本 [风险：低] [端：Both]",
+                "3. 检查客户端和服务端 mods 是否一致；依据：E2；可逆：备份列表 [风险：低] [端：Both]",
+                "4. 临时移出 foo 验证；依据：E2；可逆：移回原目录 [风险：中] [端：Both]",
+                "5. 这一步应该被裁剪",
+                "",
+                "补充确认：",
+                "- 无",
+                "",
+                "免责声明：",
+                "以上只是模型猜测。",
+                "更多建议：",
+                "可以随便删除模组。",
+                "请注意，以下部分信息来源于网络搜索，仅供参考，请谨慎判断其准确性。",
+            ]
+        )
+        service = AnalysisService(
+            self.context,
+            self.config_manager,
+            self.runtime,
+            DummyPromptManager(),
+            self.registry,
+            MetricsService(),
+        )
+
+        result = await service.analyze_with_llm(
+            event=self.event,
+            source_name="latest.log",
+            strategy="C",
+            content="ERROR test",
+            available_archive_files=[],
+            analyze_provider_id="provider-a",
+        )
+
+        self.assertTrue(result.startswith("核心问题："))
+        self.assertIn("缺少 Fabric API", result)
+        self.assertIn(NETWORK_SEARCH_NOTICE, result)
+        self.assertNotIn("好的，我来分析", result)
+        self.assertNotIn("E5", result)
+        self.assertNotIn("5. 这一步", result)
+        self.assertNotIn("免责声明", result)
+        self.assertNotIn("更多建议", result)
 
     async def test_search_mc_sites_success_and_dedup(self):
         github_payload = {
@@ -224,11 +283,16 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_search_tool_docs_updated(self):
         analyze_system = Path("assets/analyze_system.txt").read_text(encoding="utf-8")
+        analyze_user = Path("assets/analyze_user.txt").read_text(encoding="utf-8")
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn("search_mc_sites", analyze_system)
         self.assertNotIn("search_mcmod", analyze_system)
         self.assertNotIn("search_minecraft_wiki", analyze_system)
+        self.assertIn("优先给出“核对并调整相关配置文件", analyze_system)
+        self.assertIn("禁止把“删除/卸载模组”作为前置建议", analyze_system)
+        self.assertIn("优先给“检查并调整配置文件", analyze_user)
+        self.assertIn("“删除/卸载模组”只能作为最后的隔离验证手段", analyze_user)
         self.assertIn("search_mc_sites", readme)
         self.assertNotIn("search_mcmod", readme)
         self.assertNotIn("search_minecraft_wiki", readme)
