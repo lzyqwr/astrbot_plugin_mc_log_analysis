@@ -268,7 +268,7 @@ class AnalysisService:
         run_id: str = "",
         deadline: float | None = None,
     ) -> str | None:
-        toolset = self.tool_registry.build_toolset(["search_mc_sites", "read_archive_file"])
+        toolset = self.tool_registry.build_toolset(["search_mc_sites", "read_archive_file", "check_mod_fix_status"])
         system_prompt = self.prompt_manager.get_prompt("analyze_system")
         analyze_user_tpl = self.prompt_manager.get_prompt("analyze_user")
         if not system_prompt or not analyze_user_tpl:
