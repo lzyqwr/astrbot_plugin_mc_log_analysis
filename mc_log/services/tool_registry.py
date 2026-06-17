@@ -11,6 +11,7 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 
 from ..config import MAX_ARCHIVE_TOOL_CHARS
 from ..domain.detection import looks_like_multiple_paths, resolve_archive_file_request
+from .mod_fix_status import ModFixStatusService
 
 
 SEARCH_SOURCE_SPECS = (
@@ -29,6 +30,13 @@ class ToolRegistry:
         self.file_adapter = file_adapter
         self.http_adapter = http_adapter
         self.privacy_service = privacy_service
+        self.mod_fix_status_service = ModFixStatusService(
+            context,
+            config_manager,
+            runtime,
+            http_adapter,
+            privacy_service,
+        )
         self._tool_registered = False
 
     def _cfg(self):
@@ -62,9 +70,52 @@ class ToolRegistry:
             },
             handler=self.tool_read_archive_file,
         )
-        self.context.add_llm_tools(search_sites_tool, read_archive_file_tool)
+        check_mod_fix_status_tool = FunctionTool(
+            name="check_mod_fix_status",
+            description=(
+                "检查嫌疑模组当前版本之后的兼容更新日志，判断用户遇到的问题是否可能已被新版修复。"
+                "仅在日志已识别出 1-5 个嫌疑模组后调用；不要因为有新版就建议更新。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "problem": {
+                        "type": "string",
+                        "description": "用户遇到的问题摘要，包含关键崩溃类型、线程、模块或兼容线索。",
+                    },
+                    "mc_version": {"type": "string", "description": "当前 Minecraft 版本。"},
+                    "loader": {"type": "string", "description": "加载器，如 fabric、forge、neoforge、quilt。"},
+                    "mods": {
+                        "type": "array",
+                        "description": "1-5 个嫌疑模组。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "模组显示名。"},
+                                "version": {"type": "string", "description": "当前模组版本。"},
+                                "mod_id": {"type": "string", "description": "可选，日志中的 mod id。"},
+                                "filename": {"type": "string", "description": "可选，模组 jar 文件名。"},
+                                "source_url": {"type": "string", "description": "可选，项目主页或 GitHub 地址。"},
+                                "hashes": {
+                                    "type": "object",
+                                    "description": "可选，文件 hash。",
+                                    "properties": {
+                                        "sha1": {"type": "string"},
+                                        "sha512": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "required": ["name", "version"],
+                        },
+                    },
+                },
+                "required": ["problem", "mc_version", "loader", "mods"],
+            },
+            handler=self.tool_check_mod_fix_status,
+        )
+        self.context.add_llm_tools(search_sites_tool, read_archive_file_tool, check_mod_fix_status_tool)
         self._tool_registered = True
-        logger.info("[mc_log] 工具已注册: search_mc_sites, read_archive_file")
+        logger.info("[mc_log] 工具已注册: search_mc_sites, read_archive_file, check_mod_fix_status")
 
     def build_toolset(self, names: list[str]) -> ToolSet | None:
         manager = self.context.get_llm_tool_manager()
@@ -89,6 +140,35 @@ class ToolRegistry:
         self.dedupe_search_results(results)
         formatted = self.format_search_results(normalized, results)
         return self.http_adapter.tool_response_sanitize(formatted, "mc_sites", reference_only=True)
+
+    async def tool_check_mod_fix_status(
+        self,
+        event,
+        problem: str,
+        mc_version: str,
+        loader: str,
+        mods: list[dict] | None = None,
+    ) -> str:
+        logger.info(
+            f"[mc_log][tool] check_mod_fix_status 请求: mc_version={mc_version}, loader={loader}, "
+            f"mods={len(mods or [])}"
+        )
+        try:
+            payload = await self.mod_fix_status_service.check_mod_fix_status(
+                event=event,
+                problem=problem,
+                mc_version=mc_version,
+                loader=loader,
+                mods=mods,
+            )
+        except Exception as exc:
+            logger.warning(f"[mc_log][tool] check_mod_fix_status 失败: {exc}", exc_info=True)
+            payload = {
+                "status": "partial",
+                "results": [],
+                "warnings": [f"tool failed: {exc}"],
+            }
+        return self.privacy_service.guard_for_llm(json.dumps(payload, ensure_ascii=False))
 
     async def search_github_issues(self, query: str) -> dict:
         search_query = f"{query} is:issue"

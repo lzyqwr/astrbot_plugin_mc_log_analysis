@@ -122,6 +122,15 @@ class DomainLogicTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertFalse(selected[1])
 
+    def test_archive_name_can_match_crash_keyword(self):
+        file_comp = FakeFileComponent(name="crash-report.zip", source="")
+        event = FakeEvent(messages=[file_comp])
+
+        selected = pick_target_file(event)
+
+        self.assertIsNotNone(selected)
+        self.assertTrue(selected[1])
+
     def test_resolve_archive_request_and_privacy_metrics(self):
         file_map = {
             "logs/latest.log": Path("logs/latest.log"),
