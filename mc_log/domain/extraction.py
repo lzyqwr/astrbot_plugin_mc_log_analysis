@@ -125,6 +125,17 @@ CLASSLOAD_LINE_RE = re.compile(
     r"Could not execute entrypoint|Attempted to load class|invalid dist|has failed to load correctly)",
     re.I,
 )
+POSITION_INDEPENDENT_EVIDENCE_RE = re.compile(
+    r"(Java8Detector|java\.base/|Nashorn.*(?:planned to be removed|deprecated|removed)|"
+    r"ScriptException|javax\.script|jdk\.nashorn|org\.openjdk\.nashorn|calculateFinalDamage|"
+    r"Expected\b.+\bbut found|ExceptionInInitializerError|<clinit>|"
+    r"InaccessibleObjectException|IllegalAccessError|IllegalAccessException|NoSuchMethodException|"
+    r"NoSuchMethodError|NoSuchFieldError|\baddURL\b|setAccessible|"
+    r"module .+ does not .+(?:opens|exports)|cannot access class|"
+    r"EntityTransformEvent)",
+    re.I,
+)
+JAVA_BASE_FRAME_RE = re.compile(r"\bat\s+java\.base/", re.I)
 MOD_INFO_LINE_RE = re.compile(
     r"(^\s*(?:Mod File|Mod file|Mod version|Mod List|Suspected Mods|Loaded mod|Found mod)\b|"
     r"\b(?:entrypoint|coremod|transformer)\b)",
@@ -184,6 +195,10 @@ FOLD_COORD_TRIPLE_RE = re.compile(
     r"(?<![\w.])-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?(?![\w.])"
 )
 FOLD_NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
+THROWABLE_SIGNATURE_RE = re.compile(
+    r"((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*(?:Exception|Error|Throwable|LinkageError))"
+    r"(?::\s*([^\r\n]+))?"
+)
 
 
 @dataclass(frozen=True)
@@ -525,6 +540,8 @@ class ExtractionDomain:
             score += 5
         if CLASSLOAD_LINE_RE.search(text) or MC_DIAGNOSTIC_LINE_RE.search(text):
             score += 5
+        if POSITION_INDEPENDENT_EVIDENCE_RE.search(raw_or_body):
+            score += 1 if JAVA_BASE_FRAME_RE.search(raw_or_body) else 9
         if DATAPACK_FAILURE_RE.search(text) or SHADER_FAILURE_RE.search(text):
             score += 5
         if OOM_RE.search(raw_or_body):
@@ -589,6 +606,69 @@ class ExtractionDomain:
     def is_strategy_c_block_seed(self, line: str, normalized: str | None = None) -> bool:
         text = normalized if normalized is not None else self.normalize_log_line(line)
         return bool(STACKTRACE_SEED_RE.search(text))
+
+    def is_position_independent_evidence_record(self, record: StrategyCLineRecord) -> bool:
+        raw_or_body = f"{record.raw}\n{record.normalized}"
+        return bool(POSITION_INDEPENDENT_EVIDENCE_RE.search(raw_or_body))
+
+    def extract_throwable_signature(self, record: StrategyCLineRecord) -> str | None:
+        match = THROWABLE_SIGNATURE_RE.search(record.normalized)
+        if not match:
+            return None
+        throwable = match.group(1)
+        detail = self.normalize_line_for_body_fold(match.group(2) or "")
+        return f"{throwable}:{detail[:120]}"
+
+    def collect_priority_evidence_indexes_from_records(
+        self,
+        records: list[StrategyCLineRecord],
+        window: int,
+        max_throwable_signatures: int = 32,
+    ) -> set[int]:
+        if not records:
+            return set()
+        context_window = min(4, max(1, int(window)))
+        selected: set[int] = set()
+        seen_throwables: set[str] = set()
+
+        for record in records:
+            is_protected = self.is_position_independent_evidence_record(record)
+            throwable_signature = self.extract_throwable_signature(record)
+            keep_throwable = (
+                throwable_signature is not None
+                and throwable_signature not in seen_throwables
+                and len(seen_throwables) < max_throwable_signatures
+            )
+            if keep_throwable and throwable_signature is not None:
+                seen_throwables.add(throwable_signature)
+            if not is_protected and not keep_throwable:
+                continue
+
+            if is_protected and JAVA_BASE_FRAME_RE.search(record.normalized):
+                selected.add(record.index)
+            else:
+                selected.update(self.expand_indexes(len(records), record.index, context_window))
+
+            if self.is_strategy_c_block_seed(record.raw, record.normalized):
+                selected.update(
+                    self.collect_strategy_c_block_indexes_from_records(records, record.index)
+                )
+
+        return selected
+
+    def has_actionable_failure_record(self, records: list[StrategyCLineRecord]) -> bool:
+        for record in records:
+            raw_or_body = f"{record.raw}\n{record.normalized}"
+            if (
+                FATAL_EXCEPTION_RE.search(raw_or_body)
+                or CLASSLOAD_LINE_RE.search(record.normalized)
+                or MC_DIAGNOSTIC_LINE_RE.search(record.normalized)
+                or DEPENDENCY_HEADER_RE.search(record.normalized)
+                or DEPENDENCY_DETAIL_RE.search(record.normalized)
+                or self.is_position_independent_evidence_record(record)
+            ):
+                return True
+        return False
 
     def expand_indexes(self, size: int, center: int, radius: int) -> set[int]:
         if size <= 0:
@@ -865,6 +945,7 @@ class ExtractionDomain:
         indexes: Iterable[int],
         termination_note: str,
         limit: int | None = None,
+        priority_indexes: Iterable[int] | None = None,
     ) -> str:
         selected = sorted(set(indexes))
         body = self.compose_strategy_c_records_with_gaps(records, selected)
@@ -872,6 +953,11 @@ class ExtractionDomain:
         if not limit or len(full) <= limit:
             return full
 
+        priority_selected = sorted(
+            index
+            for index in set(priority_indexes or [])
+            if 0 <= index < len(records)
+        )
         tail_start = max(0, len(records) - STRATEGY_C_HEAD_TAIL_LINES)
         head_indexes = [index for index in selected if index < STRATEGY_C_HEAD_TAIL_LINES]
         tail_indexes = [index for index in selected if index >= tail_start]
@@ -882,13 +968,52 @@ class ExtractionDomain:
             and records[index].score >= STRATEGY_C_STRONG_SCORE
         ]
 
-        protected_indexes = sorted(set(head_indexes + strong_middle_indexes + tail_indexes))
+        protected_indexes = sorted(
+            set(head_indexes + strong_middle_indexes + tail_indexes + priority_selected)
+        )
         protected = self.join_strategy_c_parts(
             termination_note,
             self.compose_strategy_c_records_with_gaps(records, protected_indexes),
         )
         if len(protected) <= limit:
             return protected
+
+        if priority_selected:
+            priority_and_tail_indexes = sorted(set(priority_selected + tail_indexes))
+            priority_and_tail = self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, priority_and_tail_indexes),
+            )
+            if len(priority_and_tail) <= limit:
+                return priority_and_tail
+
+            priority_only = self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, priority_selected),
+            )
+            if len(priority_only) <= limit:
+                return priority_only
+
+            lo = 0
+            hi = len(priority_selected)
+            best_priority: list[int] = []
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate_indexes = priority_selected[:mid]
+                candidate = self.join_strategy_c_parts(
+                    termination_note,
+                    self.compose_strategy_c_records_with_gaps(records, candidate_indexes),
+                )
+                if len(candidate) <= limit:
+                    best_priority = candidate_indexes
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best_priority:
+                return self.join_strategy_c_parts(
+                    termination_note,
+                    self.compose_strategy_c_records_with_gaps(records, best_priority),
+                )
 
         head_tail_indexes = sorted(set(head_indexes + tail_indexes))
         head_tail = self.join_strategy_c_parts(
@@ -1019,6 +1144,7 @@ class ExtractionDomain:
         selected: set[int] = set()
         for center in centers:
             selected.update(self.expand_indexes(len(lines), center, max_window))
+        selected.update(self.collect_priority_evidence_indexes_from_records(records, max_window))
         return selected
 
     def strategy_c_termination_note(self, records: list[StrategyCLineRecord]) -> str:
@@ -1051,7 +1177,10 @@ class ExtractionDomain:
         last_line = self.format_log_line_for_output(last_record.raw, last_record.parsed)
         if not category:
             category = "无声中断"
-            hint = "；尾部无异常块/崩溃报告落点，真凶大概率在独立 hs_err_pid*.log 或启动器/系统日志"
+            if self.has_actionable_failure_record(records):
+                hint = "；尾部无异常块，但前文已有异常/初始化失败证据，优先分析已保留的根因片段"
+            else:
+                hint = "；尾部无异常块/崩溃报告落点，真凶大概率在独立 hs_err_pid*.log 或启动器/系统日志"
         else:
             hint = ""
         return f"[termination] type={category}; last_logger={last_logger}; last_non_noise={last_line}{hint}"
@@ -1075,6 +1204,9 @@ class ExtractionDomain:
         must_keep_indexes = self.collect_must_keep_indexes_from_records(
             records, must_keep_window
         )
+        priority_indexes = self.collect_priority_evidence_indexes_from_records(
+            records, must_keep_window
+        )
         selected_with_must_keep = set(selected) | must_keep_indexes
         unified_selected, noise_removed = self.prune_strategy_c_noise_indexes_from_records(
             records, selected_with_must_keep
@@ -1085,6 +1217,7 @@ class ExtractionDomain:
             unified_selected,
             termination_note,
             budget_limit,
+            priority_indexes=priority_indexes,
         )
         if self.should_fallback_strategy_c(reduced, key_hits, strong_key_hits, lines):
             logger.warning(
@@ -1094,19 +1227,21 @@ class ExtractionDomain:
             )
             fallback_selected, _ = self.prune_strategy_c_noise_indexes_from_records(
                 records,
-                self.collect_error_focused_indexes(lines),
+                set(self.collect_error_focused_indexes(lines)) | priority_indexes,
             )
             fallback = self.compose_strategy_c_budgeted_text(
                 records,
                 fallback_selected,
                 termination_note,
                 budget_limit,
+                priority_indexes=priority_indexes,
             )
             return self.redact_strategy_c_output(fallback)
 
         logger.info(
             f"[mc_log][{run_id}] C策略正则去噪完成: total_lines={len(lines)}, "
             f"selected_lines={len(selected)}, must_keep_lines={len(must_keep_indexes)}, "
+            f"priority_lines={len(priority_indexes)}, "
             f"unified_selected_lines={len(unified_selected)}, "
             f"raw_key_hits={raw_key_hits}, key_hits={key_hits}, strong_key_hits={strong_key_hits}, "
             f"noise_candidates={noise_candidates}, noise_removed={noise_removed}"

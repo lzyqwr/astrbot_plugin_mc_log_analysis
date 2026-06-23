@@ -647,6 +647,73 @@ class DomainLogicTests(unittest.TestCase):
 
         self.assertIn("type=OOM", extraction.build_strategy_c_regex_text(content))
 
+    def test_strategy_c_budget_preserves_position_independent_evidence(self):
+        extraction = ExtractionDomain(
+            ConfigManager({"must_keep_window_lines": 2}).get
+        )
+        lines = [
+            f"[15:00:{idx % 60:02d}] [main/INFO]: bootstrap {idx}"
+            for idx in range(240)
+        ]
+        lines.extend(
+            [
+                (
+                    "[15:04:01] [Server thread/WARN]: WorldEdit "
+                    "Java8Detector failed while reading java.specification.version"
+                ),
+                (
+                    "[15:04:02] [Server thread/WARN]: "
+                    "java.lang.ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1"
+                ),
+                "[15:04:03] [Server thread/WARN]: at java.base/java.lang.StringLatin1.charAt(StringLatin1.java:48)",
+                (
+                    "[15:04:04] [Server thread/WARN]: Warning: Nashorn engine is "
+                    "planned to be removed from a future JDK release"
+                ),
+                (
+                    "[15:04:05] [Server thread/ERROR]: javax.script.ScriptException: "
+                    "<eval>:1:18 Expected ; but found calculateFinalDamage"
+                ),
+                (
+                    "[15:04:06] [Server thread/ERROR]: "
+                    "at jdk.nashorn.api.scripting.NashornScriptEngine.throwAsScriptException"
+                ),
+                "[15:04:07] [Server thread/ERROR]: java.lang.ExceptionInInitializerError",
+                (
+                    "[15:04:08] [Server thread/ERROR]: "
+                    "at pers.neige.neigeitems.manager.ItemManager.<clinit>(ItemManager.java:42)"
+                ),
+                (
+                    "[15:04:09] [Server thread/WARN]: Could not pass event "
+                    "EntityTransformEvent to MythicMobs v4.12.0"
+                ),
+                (
+                    "[15:04:10] [Server thread/WARN]: java.lang.NoClassDefFoundError: "
+                    "org/bukkit/event/entity/EntityTransformEvent"
+                ),
+            ]
+        )
+        lines.extend(
+            f"[15:05:{idx % 60:02d}] [main/INFO]: quiet tail {idx}"
+            for idx in range(280)
+        )
+
+        reduced = extraction.build_strategy_c_regex_text(
+            "\n".join(lines),
+            budget_limit=2600,
+        )
+
+        self.assertLessEqual(len(reduced), 2600)
+        self.assertIn("Java8Detector", reduced)
+        self.assertIn("java.base/java.lang.StringLatin1", reduced)
+        self.assertIn("Nashorn engine is planned to be removed", reduced)
+        self.assertIn("calculateFinalDamage", reduced)
+        self.assertIn("ExceptionInInitializerError", reduced)
+        self.assertIn("<clinit>", reduced)
+        self.assertIn("EntityTransformEvent", reduced)
+        self.assertIn("前文已有异常/初始化失败证据", reduced)
+        self.assertNotIn("真凶大概率", reduced)
+
     def test_strategy_c_budget_keeps_tail_when_middle_is_too_large(self):
         extraction = ExtractionDomain(ConfigManager({}).get)
         lines = [
@@ -768,6 +835,7 @@ class DomainLogicTests(unittest.TestCase):
         self.assertIsInstance(cases[0], GoldExtractionCase)
         self.assertEqual(metrics["macro_root_recall"], 1.0)
         self.assertEqual(metrics["macro_support_recall"], 1.0)
+        self.assertEqual(metrics["macro_signature_recall"], 1.0)
         self.assertEqual(metrics["macro_culprit_recall"], 1.0)
         self.assertEqual(metrics["macro_noise_leak"], 0.0)
         self.assertEqual(metrics["case_success_rate"], 1.0)
