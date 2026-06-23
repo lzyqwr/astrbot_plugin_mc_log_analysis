@@ -124,6 +124,18 @@
     "default": 30,
     "hint": "命中关键证据时，会额外保留上下各 N 行上下文。"
   },
+  "strategy_c_compact_prefix": {
+    "description": "分析预算 / C 策略压缩日志前缀",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会移除大多数时间戳，并把 [时间][线程/级别][logger] 压缩为更短的前缀，减少进入模型的 token。"
+  },
+  "strategy_c_keep_timestamps": {
+    "description": "分析预算 / C 策略保留时间戳",
+    "type": "bool",
+    "default": false,
+    "hint": "仅在 C 策略压缩前缀时生效；需要对齐 watchdog/tick 耗时等绝对时序时可开启。"
+  },
   "max_tool_calls": {
     "description": "分析预算 / 最大工具调用次数",
     "type": "int",

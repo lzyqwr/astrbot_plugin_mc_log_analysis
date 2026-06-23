@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
     "max_archive_total_bytes": 32 * 1024 * 1024,
     "max_gz_output_bytes": 16 * 1024 * 1024,
     "must_keep_window_lines": 30,
+    "strategy_c_compact_prefix": True,
+    "strategy_c_keep_timestamps": False,
     "diag_version": "1.0.0",
     "metrics_enabled": True,
     "metrics_path": "audit_metrics.jsonl",
@@ -137,6 +139,8 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
         1024 * 1024, int(cfg.get("max_gz_output_bytes", 16 * 1024 * 1024))
     )
     cfg["must_keep_window_lines"] = max(5, int(cfg.get("must_keep_window_lines", 30)))
+    cfg["strategy_c_compact_prefix"] = bool(cfg.get("strategy_c_compact_prefix", True))
+    cfg["strategy_c_keep_timestamps"] = bool(cfg.get("strategy_c_keep_timestamps", False))
     cfg["diag_version"] = str(cfg.get("diag_version", "1.0.0") or "1.0.0")
     cfg["metrics_enabled"] = bool(cfg.get("metrics_enabled", True))
     cfg["metrics_path"] = str(

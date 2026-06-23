@@ -67,6 +67,8 @@
 | `max_archive_total_bytes` | `int` | `33554432` | 压缩包解压后总字节数上限 |
 | `max_gz_output_bytes` | `int` | `16777216` | gz 解压后最大字节数 |
 | `must_keep_window_lines` | `int` | `30` | 强制保留证据窗口行数（上下各 N 行） |
+| `strategy_c_compact_prefix` | `bool` | `true` | C 策略压缩日志前缀，减少重复时间戳/线程信息 |
+| `strategy_c_keep_timestamps` | `bool` | `false` | C 策略压缩前缀时仍保留时间戳，用于需要绝对时序的日志 |
 | `diag_version` | `string` | `1.0.0` | 诊断系统版本号 |
 | `metrics_enabled` | `bool` | `true` | 是否启用结构化指标落库 |
 | `metrics_path` | `string` | `audit_metrics.jsonl` | 指标落库文件名（相对 data 目录） |
