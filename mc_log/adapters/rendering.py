@@ -227,7 +227,7 @@ class RenderingAdapter:
                 content=[Comp.Plain(placeholder)], name=sender_name, uin=sender_uin
             )
             nodes.append(node3)
-            nodes.append(node4)
+        nodes.append(Comp.Node(content=[Comp.Plain(node4)], name=sender_name, uin=sender_uin))
         return event.chain_result([Comp.Nodes(nodes=nodes)])
 
     def build_code_blocks_message(self, markdown_text: str) -> str:
