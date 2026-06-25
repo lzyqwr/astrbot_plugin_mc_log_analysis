@@ -299,7 +299,48 @@
         "type": "text",
         "default": "分析完成，耗时 {elapsed:.2f} 秒\n文件: {source_name}\n策略: {strategy}",
         "hint": "支持占位符：{elapsed}、{source_name}、{strategy}。"
+      },
+      "feedback_placeholder": {
+        "description": "输出阶段 / 反馈上报占位文案",
+        "type": "text",
+        "default": "反馈上报\n如需上报本次分析数据（输入文件、运行日志、分析结果），请回复本条合并转发消息并发送 /上报",
+        "hint": "合并转发消息末尾追加的占位节点文案；留空则不追加该节点。"
+      },
+      "report_no_run": {
+        "description": "上报指令 / 无可上报记录提示",
+        "type": "string",
+        "default": "暂无可上报的运行记录，请先触发一次日志分析。"
+      },
+      "report_packaged": {
+        "description": "上报指令 / 打包成功提示",
+        "type": "string",
+        "default": "已打包本次分析数据。"
+      },
+      "report_packaged_failed": {
+        "description": "上报指令 / 打包失败提示",
+        "type": "string",
+        "default": "上报数据打包失败，请检查日志。"
+      },
+      "report_disabled": {
+        "description": "上报指令 / 功能未启用提示",
+        "type": "string",
+        "default": "反馈上报功能未启用。"
       }
+    }
+  },
+  "report_enabled": {
+    "description": "反馈上报 / 启用反馈上报",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会在合并转发消息末尾追加占位节点，并允许使用 /上报 指令打包本次分析数据。"
+  },
+  "report_history_size": {
+    "description": "反馈上报 / 每会话保留运行数",
+    "type": "int",
+    "default": 3,
+    "hint": "每个会话保留的最近可上报运行数量。",
+    "condition": {
+      "report_enabled": true
     }
   }
 }

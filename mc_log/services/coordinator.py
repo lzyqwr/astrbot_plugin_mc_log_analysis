@@ -15,6 +15,7 @@ from ..models import (
     ExtractionResult,
     RenderResult,
     RunContext,
+    RunReport,
 )
 from ..platform_compat import (
     session_whitelist_candidates,
@@ -36,6 +37,7 @@ class Coordinator:
         rendering_adapter,
         analysis_service,
         tool_registry,
+        report_store=None,
     ):
         self.context = context
         self.config_manager = config_manager
@@ -48,6 +50,7 @@ class Coordinator:
         self.rendering_adapter = rendering_adapter
         self.analysis_service = analysis_service
         self.tool_registry = tool_registry
+        self.report_store = report_store
         self._metrics_lock = asyncio.Lock()
 
     def _cfg(self):
@@ -92,6 +95,41 @@ class Coordinator:
                     file_obj.write(line + "\n")
         except Exception as exc:
             logger.warning(f"[mc_log] 写入指标失败: {exc}")
+
+    async def _register_report(
+        self,
+        event,
+        run_id: str,
+        local_file: Path,
+        source_name: str,
+        report_md: str,
+        started: float,
+    ) -> None:
+        store = self.report_store
+        if not store or not store.enabled():
+            return
+        try:
+            saved_input = await store.save_input_file(local_file, run_id)
+            debug_log_path = store.resolve_debug_log_path(run_id)
+            report = RunReport(
+                run_id=run_id,
+                session_id=str(event.get_session_id() or ""),
+                sender_id=str(event.get_sender_id() or ""),
+                timestamp=time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(started)
+                ),
+                source_name=source_name,
+                input_file_path=saved_input,
+                debug_log_path=debug_log_path,
+                analysis_md=report_md or "",
+            )
+            await store.register_run(report)
+            logger.info(
+                f"[mc_log][{run_id}] 已登记反馈上报记录: session={report.session_id}, "
+                f"input={'yes' if saved_input else 'no'}, debug_log={'yes' if debug_log_path.exists() else 'no'}"
+            )
+        except Exception as exc:
+            logger.warning(f"[mc_log][{run_id}] 登记反馈上报记录失败: {exc}")
 
     async def extract_content(
         self,
@@ -178,45 +216,12 @@ class Coordinator:
     async def extract_selected_path(
         self, path: Path, run_id: str = "", deadline: float | None = None
     ) -> tuple[str, str]:
-        name_lower = path.name.lower()
-        strategy = self.extraction_domain.strategy_from_text_name(name_lower)
-        if strategy == "B" and "debug" not in name_lower:
-            try:
-                peek_content = await self.file_adapter.read_text_with_fallback(
-                    path, deadline=deadline
-                )
-                strategy = self.extraction_domain.strategy_from_name_and_peek(
-                    name_lower, peek_content
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"[mc_log][{run_id}] 文本文件内容嗅探失败，沿用文件名策略: file={path.name}, error={exc}"
-                )
-        logger.info(
-            f"[mc_log][{run_id}] 文本文件策略判定: file={path.name}, strategy={strategy}"
-        )
-        if strategy == "A":
-            kind = "hs_err" if "hs_err" in name_lower else "crash"
-            content = await self.extraction_domain.strategy_a_extract(
-                path,
-                kind,
-                self.file_adapter.read_text_with_fallback,
-                deadline=deadline,
-            )
-            return content, strategy
-        if strategy == "B":
-            content = await self.extraction_domain.strategy_b_extract(
-                path, self.file_adapter.read_text_with_fallback, deadline=deadline
-            )
-            return content, strategy
-
-        content = await self.extraction_domain.strategy_c_extract(
+        return await self.extraction_domain.extract_path_by_strategy(
             path,
             self.file_adapter.read_text_with_fallback,
             run_id=run_id,
             deadline=deadline,
         )
-        return content, strategy
 
     async def handle_message(self, event):
         self.config_manager.reload()
@@ -451,6 +456,14 @@ class Coordinator:
                                         code_blocks_text=self.rendering_adapter.build_code_blocks_message(
                                             report_md
                                         ),
+                                    )
+                                    await self._register_report(
+                                        event=event,
+                                        run_id=run_id,
+                                        local_file=local_file,
+                                        source_name=extraction_result.source_name,
+                                        report_md=report_md,
+                                        started=started,
                                     )
                                     elapsed = time.monotonic() - started
                                     logger.info(

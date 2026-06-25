@@ -16,7 +16,7 @@ if __package__:
     from .mc_log.domain import ExtractionDomain, MetricsService, PrivacyService
     from .mc_log.prompts import PromptManager
     from .mc_log.runtime import PluginRuntime
-    from .mc_log.services import AnalysisService, Coordinator, ToolRegistry
+    from .mc_log.services import AnalysisService, Coordinator, ReportStore, ToolRegistry
 else:
     plugin_root = Path(__file__).resolve().parent
     if str(plugin_root) not in sys.path:
@@ -27,7 +27,7 @@ else:
     from mc_log.domain import ExtractionDomain, MetricsService, PrivacyService
     from mc_log.prompts import PromptManager
     from mc_log.runtime import PluginRuntime
-    from mc_log.services import AnalysisService, Coordinator, ToolRegistry
+    from mc_log.services import AnalysisService, Coordinator, ReportStore, ToolRegistry
 
 
 @register(
@@ -66,6 +66,7 @@ class LogAnalyzer(Star):
             self.file_adapter,
             self.http_adapter,
             self.privacy_service,
+            self.extraction_domain,
         )
         self.analysis_service = AnalysisService(
             self.context,
@@ -75,6 +76,7 @@ class LogAnalyzer(Star):
             self.tool_registry,
             self.metrics_service,
         )
+        self.report_store = ReportStore(self.config_manager, self.runtime)
         self.coordinator = Coordinator(
             self.context,
             self.config_manager,
@@ -87,6 +89,7 @@ class LogAnalyzer(Star):
             self.rendering_adapter,
             self.analysis_service,
             self.tool_registry,
+            self.report_store,
         )
         self._sync_aliases()
 
@@ -108,6 +111,7 @@ class LogAnalyzer(Star):
         self.tool_registry.register_tools()
         self.runtime.install_record_factory()
         self.runtime.cleanup_stale_temp_dirs(hours=24, remover=self.file_adapter.safe_remove_dir_blocking)
+        self.report_store.cleanup_stale_pending(hours=24)
         logger.info("[mc_log] 插件已初始化")
 
     async def terminate(self):
@@ -135,6 +139,45 @@ class LogAnalyzer(Star):
             [
                 Comp.Plain("这是最近一次触发的单次调试日志。"),
                 Comp.File(name=f"mc_log_debug_{stamp}.log", file=str(path)),
+            ]
+        )
+        result.stop_event()
+        yield result
+
+    @filter.command("上报")
+    async def report_run(self, event: AstrMessageEvent):
+        self.config_manager.reload()
+        self._sync_aliases()
+        if not self.report_store.enabled():
+            result = event.plain_result(self.config_manager.msg("report_disabled"))
+            result.stop_event()
+            yield result
+            return
+        report = await self.report_store.find_recent(
+            str(event.get_session_id() or "")
+        )
+        if not report:
+            result = event.plain_result(self.config_manager.msg("report_no_run"))
+            result.stop_event()
+            yield result
+            return
+        zip_path = await self.report_store.package_report(report)
+        if not zip_path or not zip_path.exists():
+            result = event.plain_result(
+                self.config_manager.msg("report_packaged_failed")
+            )
+            result.stop_event()
+            yield result
+            return
+        notice = self.config_manager.msg("report_packaged")
+        summary = (
+            f"{notice}\n运行ID: {report.run_id}\n文件: {report.source_name}\n"
+            f"时间: {report.timestamp}\n存档: {zip_path}"
+        )
+        result = event.chain_result(
+            [
+                Comp.Plain(summary),
+                Comp.File(name=zip_path.name, file=str(zip_path)),
             ]
         )
         result.stop_event()
