@@ -11,6 +11,7 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 
 from ..config import MAX_ARCHIVE_TOOL_CHARS
 from ..domain.detection import looks_like_multiple_paths, resolve_archive_file_request
+from ..domain.extraction import ExtractionDomain
 from .mod_fix_status import ModFixStatusService
 
 
@@ -23,13 +24,23 @@ SEARCH_SOURCE_PRIORITY = {key: idx for idx, (key, _) in enumerate(SEARCH_SOURCE_
 
 
 class ToolRegistry:
-    def __init__(self, context, config_manager, runtime, file_adapter, http_adapter, privacy_service):
+    def __init__(
+        self,
+        context,
+        config_manager,
+        runtime,
+        file_adapter,
+        http_adapter,
+        privacy_service,
+        extraction_domain=None,
+    ):
         self.context = context
         self.config_manager = config_manager
         self.runtime = runtime
         self.file_adapter = file_adapter
         self.http_adapter = http_adapter
         self.privacy_service = privacy_service
+        self.extraction_domain = extraction_domain or ExtractionDomain(config_manager.get)
         self.mod_fix_status_service = ModFixStatusService(
             context,
             config_manager,
@@ -59,7 +70,7 @@ class ToolRegistry:
         )
         read_archive_file_tool = FunctionTool(
             name="read_archive_file",
-            description="读取当前待分析压缩包里的指定文本文件内容。请优先使用完整路径,仅在当前日志不足以提供充足信息时使用,严禁在日志信息充足时使用。",
+            description="按正常日志提取策略读取当前待分析压缩包里的指定文本文件。请优先使用完整路径,仅在当前日志不足以提供充足信息时使用,严禁在日志信息充足时使用。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -383,13 +394,13 @@ class ToolRegistry:
         if looks_like_multiple_paths(normalized):
             return "单次调用只能索要一个文件，请仅提供一个 file_path。"
 
-        consumed, consume_msg = self.runtime.consume_archive_tool_call(event, self._cfg())
-        if not consumed:
-            return consume_msg
-
         resolved_key, resolved_path, err = resolve_archive_file_request(file_map, normalized)
         if not resolved_path:
             return err
+
+        consumed, consume_msg = self.runtime.consume_archive_tool_call(event, self._cfg())
+        if not consumed:
+            return consume_msg
         if self.runtime.is_primary_source_file(event, resolved_key):
             return f"`{resolved_key}` 已作为当前主分析日志输入，无需重复读取。仅在当前日志无法提供有用信息时再读取其他文件。"
 
@@ -403,14 +414,23 @@ class ToolRegistry:
             return f"`{resolved_key}` 看起来是二进制文件，无法直接作为文本分析。"
 
         limit = max(1000, min(int(max_chars or MAX_ARCHIVE_TOOL_CHARS), 80000))
-        text = self.privacy_service.guard_for_llm(await self.file_adapter.read_text_with_fallback(resolved_path))
+        try:
+            text, strategy = await self.extraction_domain.extract_path_by_strategy(
+                resolved_path,
+                self.file_adapter.read_text_with_fallback,
+                run_id="read_archive_file",
+            )
+        except Exception as exc:
+            logger.warning(f"[mc_log][tool] 提取归档文件失败: path={resolved_path}, err={exc}")
+            return f"读取 `{resolved_key}` 失败：{exc}"
+        text = self.privacy_service.guard_for_llm(text)
         if len(text) > limit:
             text = text[:limit] + "\n...[内容已截断]..."
         logger.info(
-            f"[mc_log][tool] read_archive_file 命中: file={resolved_key}, raw_bytes={len(raw)}, returned_chars={len(text)}"
+            f"[mc_log][tool] read_archive_file 命中: file={resolved_key}, strategy={strategy}, raw_bytes={len(raw)}, returned_chars={len(text)}"
         )
         return self.http_adapter.tool_response_sanitize(
-            f"归档文件 `{resolved_key}` 内容:\n{text}",
+            f"归档文件 `{resolved_key}` 内容（提取策略：{strategy}）:\n{text}",
             "read_archive_file",
             reference_only=False,
         )
@@ -425,7 +445,7 @@ class ToolRegistry:
             lines.append(f"- ...(其余 {len(files) - len(clipped)} 个文件已省略)")
         return (
             "【可用归档文件列表】\n"
-            f"如需补充证据，可调用工具 `read_archive_file(file_path, max_chars)`；本次最多可调用 {limit} 次，且单次只能读取 1 个文件。\n"
+            f"如需补充证据，可调用工具 `read_archive_file(file_path, max_chars)` 按正常日志提取策略读取文件；本次最多可调用 {limit} 次，且单次只能读取 1 个文件。\n"
             "仅当当前已提供日志内容不足以支撑定位结论时才调用该工具。若当前日志已能定位问题，请不要调用工具。\n"
             "禁止读取当前主分析日志文件（避免重复读取）。\n"
             + "\n".join(lines)

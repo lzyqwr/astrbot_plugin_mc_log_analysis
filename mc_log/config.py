@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
     "max_archive_total_bytes": 32 * 1024 * 1024,
     "max_gz_output_bytes": 16 * 1024 * 1024,
     "must_keep_window_lines": 30,
+    "strategy_c_compact_prefix": True,
+    "strategy_c_keep_timestamps": False,
     "diag_version": "1.0.0",
     "metrics_enabled": True,
     "metrics_path": "audit_metrics.jsonl",
@@ -37,6 +39,8 @@ DEFAULT_CONFIG = {
     "analyze_llm_timeout_sec": 240,
     "html_render_timeout_sec": 30,
     "file_download_timeout_sec": 30,
+    "report_enabled": True,
+    "report_history_size": 3,
     "messages": {
         "accepted_notice": "已接收文件，正在分析，请稍候。",
         "download_failed": "日志文件下载失败，请稍后重试。",
@@ -53,6 +57,11 @@ DEFAULT_CONFIG = {
         "text_render_fallback_notice": "[提示] 渲染不可用，已降级为纯文本发送。",
         "forward_sender_name": "MC日志分析",
         "summary_template": "分析完成，耗时 {elapsed:.2f} 秒\n文件: {source_name}\n策略: {strategy}",
+        "feedback_placeholder": "反馈上报\n如需上报本次分析数据（输入文件、运行日志、分析结果），请回复本条合并转发消息并发送 /上报",
+        "report_no_run": "暂无可上报的运行记录，请先触发一次日志分析。",
+        "report_packaged": "已打包本次分析数据。",
+        "report_packaged_failed": "上报数据打包失败，请检查日志。",
+        "report_disabled": "反馈上报功能未启用。",
     },
 }
 
@@ -137,6 +146,8 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
         1024 * 1024, int(cfg.get("max_gz_output_bytes", 16 * 1024 * 1024))
     )
     cfg["must_keep_window_lines"] = max(5, int(cfg.get("must_keep_window_lines", 30)))
+    cfg["strategy_c_compact_prefix"] = bool(cfg.get("strategy_c_compact_prefix", True))
+    cfg["strategy_c_keep_timestamps"] = bool(cfg.get("strategy_c_keep_timestamps", False))
     cfg["diag_version"] = str(cfg.get("diag_version", "1.0.0") or "1.0.0")
     cfg["metrics_enabled"] = bool(cfg.get("metrics_enabled", True))
     cfg["metrics_path"] = str(
@@ -166,6 +177,8 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
     cfg["analyze_llm_timeout_sec"] = max(5, int(cfg["analyze_llm_timeout_sec"]))
     cfg["html_render_timeout_sec"] = max(5, int(cfg["html_render_timeout_sec"]))
     cfg["file_download_timeout_sec"] = max(5, int(cfg["file_download_timeout_sec"]))
+    cfg["report_enabled"] = bool(cfg.get("report_enabled", True))
+    cfg["report_history_size"] = max(1, int(cfg.get("report_history_size", 3)))
     raw_render_mode = str(cfg["render_mode"]).lower().strip()
     if raw_render_mode in {"html", "html_to_image"}:
         cfg["render_mode"] = "html_to_image"

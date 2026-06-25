@@ -12,6 +12,7 @@ MAX_SECTION_LINES = 400
 STRATEGY_C_HEAD_TAIL_LINES = 180
 STRATEGY_C_WINDOW_LINES = 8
 STRATEGY_C_STRONG_SCORE = 4
+DEFAULT_STRATEGY_C_MUST_KEEP_WINDOW_LINES = 12
 ERROR_LINE_RE = re.compile(
     r"(ERROR|WARN|Exception|Caused by|FATAL|Failed|Stacktrace|Problematic frame|siginfo)",
     re.IGNORECASE,
@@ -43,6 +44,23 @@ VERSION_LINE_RE = re.compile(
     re.I,
 )
 CRASH_SAVED_RE = re.compile(r"Crash report saved to", re.I)
+FAILED_STACKTRACE_RE = re.compile(r"\bFailed\b|Stacktrace", re.I)
+FATAL_EXCEPTION_RE = re.compile(
+    r"\bFATAL\b|Exception|Caused by(?:\s+\d+)?:|Problematic frame|siginfo",
+    re.I,
+)
+OOM_RE = re.compile(r"\b(?:OutOfMemoryError|Java heap space|GC overhead limit exceeded)\b", re.I)
+WATCHDOG_RE = re.compile(
+    r"(Watchdog.*Considering it to be crashed|took too long|"
+    r"server watchdog|A single server tick took \d+)",
+    re.I,
+)
+TICKING_KEEP_UP_RE = re.compile(
+    r"(Can't keep up!.*(?:Ticking entity|Ticking block entity)|"
+    r"(?:Ticking entity|Ticking block entity).*Can't keep up!)",
+    re.I,
+)
+ORDERED_STOP_RE = re.compile(r"^\s*(?:Stopping!|Stopping server)\b", re.I)
 MC_DIAGNOSTIC_LINE_RE = re.compile(
     r"(Exception caught during firing event|Loading errors encountered|Mod loading error has occurred|"
     r"Mod loading issue for|A potential solution has been determined|More details:|Details:|"
@@ -107,6 +125,17 @@ CLASSLOAD_LINE_RE = re.compile(
     r"Could not execute entrypoint|Attempted to load class|invalid dist|has failed to load correctly)",
     re.I,
 )
+POSITION_INDEPENDENT_EVIDENCE_RE = re.compile(
+    r"(Java8Detector|java\.base/|Nashorn.*(?:planned to be removed|deprecated|removed)|"
+    r"ScriptException|javax\.script|jdk\.nashorn|org\.openjdk\.nashorn|calculateFinalDamage|"
+    r"Expected\b.+\bbut found|ExceptionInInitializerError|<clinit>|"
+    r"InaccessibleObjectException|IllegalAccessError|IllegalAccessException|NoSuchMethodException|"
+    r"NoSuchMethodError|NoSuchFieldError|\baddURL\b|setAccessible|"
+    r"module .+ does not .+(?:opens|exports)|cannot access class|"
+    r"EntityTransformEvent)",
+    re.I,
+)
+JAVA_BASE_FRAME_RE = re.compile(r"\bat\s+java\.base/", re.I)
 MOD_INFO_LINE_RE = re.compile(
     r"(^\s*(?:Mod File|Mod file|Mod version|Mod List|Suspected Mods|Loaded mod|Found mod)\b|"
     r"\b(?:entrypoint|coremod|transformer)\b)",
@@ -142,6 +171,7 @@ NOISE_LINE_PATTERNS = (
         re.I,
     ),
     re.compile(r"^\s*(?:\[[^\]]*CHAT[^\]]*\]\s*)?<[^>]{1,32}>\s+", re.I),
+    re.compile(r"CHAT_NOISE", re.I),
 )
 C_NAME_RE = re.compile(r"(latest|fcl|pcl|game[-_ ]?output|run[-_ ]?output|崩溃前|游戏崩溃)", re.I)
 B_NAME_RE = re.compile(r"\bdebug\b|日志|log", re.I)
@@ -155,6 +185,20 @@ IP_ENDPOINT_RE = re.compile(
 )
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+FOLD_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.I,
+)
+FOLD_HEX_ID_RE = re.compile(r"\b0x[0-9a-f]+\b", re.I)
+FOLD_ENTITY_ID_RE = re.compile(r"\b(entity|id|entity id|eid)[=: #]+-?\d+\b", re.I)
+FOLD_COORD_TRIPLE_RE = re.compile(
+    r"(?<![\w.])-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?(?![\w.])"
+)
+FOLD_NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
+THROWABLE_SIGNATURE_RE = re.compile(
+    r"((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*(?:Exception|Error|Throwable|LinkageError))"
+    r"(?::\s*([^\r\n]+))?"
+)
 
 
 @dataclass(frozen=True)
@@ -167,12 +211,74 @@ class ParsedLogLine:
     timestamp: str | None = None
 
 
+@dataclass(frozen=True)
+class StrategyCLineRecord:
+    index: int
+    raw: str
+    parsed: ParsedLogLine
+    normalized: str
+    score: int
+    is_noise: bool
+
+
+@dataclass
+class OutputLineGroup:
+    start: int
+    end: int
+    text: str
+    repeat_count: int = 1
+    repeat_label: str = "重复"
+
+
 class ExtractionDomain:
     def __init__(self, cfg_getter: Callable[[], object]):
         self._cfg_getter = cfg_getter
 
     def _cfg(self):
         return self._cfg_getter()
+
+    async def extract_path_by_strategy(
+        self,
+        path: Path,
+        read_text_with_fallback: Callable[..., Awaitable[str]],
+        run_id: str = "",
+        deadline: float | None = None,
+    ) -> tuple[str, str]:
+        name_lower = path.name.lower()
+        strategy = self.strategy_from_text_name(name_lower)
+        if strategy == "B" and "debug" not in name_lower:
+            try:
+                peek_content = await read_text_with_fallback(path, deadline=deadline)
+                strategy = self.strategy_from_name_and_peek(name_lower, peek_content)
+            except Exception as exc:
+                logger.warning(
+                    f"[mc_log][{run_id}] 文本文件内容嗅探失败，沿用文件名策略: file={path.name}, error={exc}"
+                )
+        logger.info(
+            f"[mc_log][{run_id}] 文本文件策略判定: file={path.name}, strategy={strategy}"
+        )
+        if strategy == "A":
+            kind = "hs_err" if "hs_err" in name_lower else "crash"
+            content = await self.strategy_a_extract(
+                path,
+                kind,
+                read_text_with_fallback,
+                deadline=deadline,
+            )
+            return content, strategy
+        if strategy == "B":
+            content = await self.strategy_b_extract(
+                path, read_text_with_fallback, deadline=deadline
+            )
+            return content, strategy
+
+        content = await self.strategy_c_extract(
+            path,
+            read_text_with_fallback,
+            run_id=run_id,
+            deadline=deadline,
+        )
+        return content, strategy
 
     async def strategy_a_extract(
         self,
@@ -217,9 +323,11 @@ class ExtractionDomain:
     ) -> str:
         cfg = self._cfg()
         content = await read_text_with_fallback(path, deadline=deadline)
-        reduced = self.build_strategy_c_regex_text(content, run_id=run_id)
-        result = self.apply_budget_with_must_keep(reduced, content, cfg["total_char_limit"])
-        return self.redact_strategy_c_output(result)
+        return self.build_strategy_c_regex_text(
+            content,
+            run_id=run_id,
+            budget_limit=cfg["total_char_limit"],
+        )
 
     def build_archive_file_map(self, files: Iterable[Path], root_dir: Path) -> dict[str, Path]:
         root = root_dir.resolve()
@@ -364,6 +472,9 @@ class ExtractionDomain:
         thread = None
         logger_name = None
         timestamp = None
+        level_tokens: list[tuple[str, str]] = []
+        fallback_logger = None
+        saw_level_token = False
 
         for token in tokens:
             token = token.strip()
@@ -371,12 +482,20 @@ class ExtractionDomain:
                 timestamp = token
                 continue
             level_match = LEVEL_TOKEN_RE.match(token)
-            if not level_match:
+            if level_match:
+                saw_level_token = True
+                level_tokens.append((level_match.group(1), level_match.group(2).upper()))
                 continue
-            if thread is None:
-                thread = level_match.group(1)
-            severity = level_match.group(2).upper()
-            logger_name = level_match.group(1)
+            if saw_level_token and fallback_logger is None:
+                fallback_logger = token
+
+        if level_tokens:
+            thread = level_tokens[0][0]
+            severity = level_tokens[-1][1]
+            if len(level_tokens) > 1:
+                logger_name = level_tokens[-1][0]
+            else:
+                logger_name = fallback_logger
 
         return ParsedLogLine(
             raw=line or "",
@@ -390,8 +509,13 @@ class ExtractionDomain:
     def is_strategy_c_key_line(self, line: str, normalized: str | None = None) -> bool:
         return self.strategy_c_line_score(line, normalized) > 0
 
-    def strategy_c_line_score(self, line: str, normalized: str | None = None) -> int:
-        parsed = self.parse_log_line(line)
+    def strategy_c_line_score(
+        self,
+        line: str,
+        normalized: str | None = None,
+        parsed: ParsedLogLine | None = None,
+    ) -> int:
+        parsed = parsed or self.parse_log_line(line)
         text = normalized if normalized is not None else parsed.body
         score = 0
         if parsed.severity == "WARN":
@@ -408,27 +532,63 @@ class ExtractionDomain:
             score += 1
         if CRASH_SAVED_RE.search(text):
             score += 4
-        if re.search(r"\bFailed\b|Stacktrace", text, re.I):
+        if FAILED_STACKTRACE_RE.search(text):
             score += 2
-        if re.search(r"\bFATAL\b|Exception|Caused by(?:\s+\d+)?:|Problematic frame|siginfo", raw_or_body, re.I):
+        if FATAL_EXCEPTION_RE.search(raw_or_body):
             score += 4
         if DEPENDENCY_HEADER_RE.search(text) or DEPENDENCY_DETAIL_RE.search(text) or DEPENDENCY_LINE_RE.search(text):
             score += 5
         if CLASSLOAD_LINE_RE.search(text) or MC_DIAGNOSTIC_LINE_RE.search(text):
             score += 5
+        if POSITION_INDEPENDENT_EVIDENCE_RE.search(raw_or_body):
+            score += 1 if JAVA_BASE_FRAME_RE.search(raw_or_body) else 9
         if DATAPACK_FAILURE_RE.search(text) or SHADER_FAILURE_RE.search(text):
             score += 5
+        if OOM_RE.search(raw_or_body):
+            score += 8
+        if WATCHDOG_RE.search(raw_or_body):
+            score += 8
+        if TICKING_KEEP_UP_RE.search(raw_or_body):
+            score += 6
+        if ORDERED_STOP_RE.search(text):
+            score += 4
         return score
 
     def is_strategy_c_noise_line(self, line: str, normalized: str | None = None) -> bool:
         text = normalized if normalized is not None else self.normalize_log_line(line)
         return any(pattern.search(text) for pattern in NOISE_LINE_PATTERNS)
 
-    def has_strategy_c_failure_context(self, lines: list[str], index: int, radius: int = 5) -> bool:
+    def build_strategy_c_records(self, lines: list[str]) -> list[StrategyCLineRecord]:
+        records: list[StrategyCLineRecord] = []
+        for index, line in enumerate(lines):
+            parsed = self.parse_log_line(line)
+            normalized = parsed.body
+            score = self.strategy_c_line_score(line, normalized, parsed)
+            is_noise = self.is_strategy_c_noise_line(line, normalized)
+            records.append(
+                StrategyCLineRecord(
+                    index=index,
+                    raw=line,
+                    parsed=parsed,
+                    normalized=normalized,
+                    score=score,
+                    is_noise=is_noise,
+                )
+            )
+        return records
+
+    def has_strategy_c_failure_context(
+        self,
+        lines: list[str],
+        index: int,
+        radius: int = 5,
+        records: list[StrategyCLineRecord] | None = None,
+    ) -> bool:
+        size = len(records) if records is not None else len(lines)
         lo = max(0, index - radius)
-        hi = min(len(lines), index + radius + 1)
-        for candidate in lines[lo:hi]:
-            body = self.normalize_log_line(candidate)
+        hi = min(size, index + radius + 1)
+        for offset in range(lo, hi):
+            body = records[offset].normalized if records is not None else self.normalize_log_line(lines[offset])
             if SHADER_FAILURE_RE.search(body) or DATAPACK_FAILURE_RE.search(body):
                 return True
         return False
@@ -446,6 +606,69 @@ class ExtractionDomain:
     def is_strategy_c_block_seed(self, line: str, normalized: str | None = None) -> bool:
         text = normalized if normalized is not None else self.normalize_log_line(line)
         return bool(STACKTRACE_SEED_RE.search(text))
+
+    def is_position_independent_evidence_record(self, record: StrategyCLineRecord) -> bool:
+        raw_or_body = f"{record.raw}\n{record.normalized}"
+        return bool(POSITION_INDEPENDENT_EVIDENCE_RE.search(raw_or_body))
+
+    def extract_throwable_signature(self, record: StrategyCLineRecord) -> str | None:
+        match = THROWABLE_SIGNATURE_RE.search(record.normalized)
+        if not match:
+            return None
+        throwable = match.group(1)
+        detail = self.normalize_line_for_body_fold(match.group(2) or "")
+        return f"{throwable}:{detail[:120]}"
+
+    def collect_priority_evidence_indexes_from_records(
+        self,
+        records: list[StrategyCLineRecord],
+        window: int,
+        max_throwable_signatures: int = 32,
+    ) -> set[int]:
+        if not records:
+            return set()
+        context_window = min(4, max(1, int(window)))
+        selected: set[int] = set()
+        seen_throwables: set[str] = set()
+
+        for record in records:
+            is_protected = self.is_position_independent_evidence_record(record)
+            throwable_signature = self.extract_throwable_signature(record)
+            keep_throwable = (
+                throwable_signature is not None
+                and throwable_signature not in seen_throwables
+                and len(seen_throwables) < max_throwable_signatures
+            )
+            if keep_throwable and throwable_signature is not None:
+                seen_throwables.add(throwable_signature)
+            if not is_protected and not keep_throwable:
+                continue
+
+            if is_protected and JAVA_BASE_FRAME_RE.search(record.normalized):
+                selected.add(record.index)
+            else:
+                selected.update(self.expand_indexes(len(records), record.index, context_window))
+
+            if self.is_strategy_c_block_seed(record.raw, record.normalized):
+                selected.update(
+                    self.collect_strategy_c_block_indexes_from_records(records, record.index)
+                )
+
+        return selected
+
+    def has_actionable_failure_record(self, records: list[StrategyCLineRecord]) -> bool:
+        for record in records:
+            raw_or_body = f"{record.raw}\n{record.normalized}"
+            if (
+                FATAL_EXCEPTION_RE.search(raw_or_body)
+                or CLASSLOAD_LINE_RE.search(record.normalized)
+                or MC_DIAGNOSTIC_LINE_RE.search(record.normalized)
+                or DEPENDENCY_HEADER_RE.search(record.normalized)
+                or DEPENDENCY_DETAIL_RE.search(record.normalized)
+                or self.is_position_independent_evidence_record(record)
+            ):
+                return True
+        return False
 
     def expand_indexes(self, size: int, center: int, radius: int) -> set[int]:
         if size <= 0:
@@ -473,30 +696,71 @@ class ExtractionDomain:
             selected.add(index)
         return selected
 
+    def collect_strategy_c_block_indexes_from_records(
+        self,
+        records: list[StrategyCLineRecord],
+        start_index: int,
+    ) -> set[int]:
+        selected = {start_index}
+        for index in range(start_index + 1, len(records)):
+            record = records[index]
+            normalized = record.normalized
+            if not normalized:
+                break
+            if LOG_EVENT_PREFIX_RE.search(record.raw) and not self.is_stacktrace_continuation_line(
+                record.raw, normalized
+            ):
+                break
+            if TIMESTAMP_LINE_RE.search(record.raw) and not self.is_stacktrace_continuation_line(
+                record.raw, normalized
+            ):
+                break
+            if not self.is_stacktrace_continuation_line(record.raw, normalized):
+                break
+            selected.add(index)
+        return selected
+
     def collect_strategy_c_noise_stats(self, lines: list[str]) -> tuple[int, int]:
+        return self.collect_strategy_c_noise_stats_from_records(
+            self.build_strategy_c_records(lines)
+        )
+
+    def collect_strategy_c_noise_stats_from_records(
+        self, records: list[StrategyCLineRecord]
+    ) -> tuple[int, int]:
         key_hits = 0
         noise_candidates = 0
-        for line in lines:
-            normalized = self.normalize_log_line(line)
-            if self.is_strategy_c_key_line(line, normalized):
+        for record in records:
+            if record.score > 0:
                 key_hits += 1
-            elif self.is_strategy_c_noise_line(line, normalized):
+            elif record.is_noise:
                 noise_candidates += 1
         return key_hits, noise_candidates
 
     def prune_strategy_c_noise_indexes(self, lines: list[str], indexes: Iterable[int]) -> tuple[list[int], int]:
+        return self.prune_strategy_c_noise_indexes_from_records(
+            self.build_strategy_c_records(lines), indexes
+        )
+
+    def prune_strategy_c_noise_indexes_from_records(
+        self,
+        records: list[StrategyCLineRecord],
+        indexes: Iterable[int],
+    ) -> tuple[list[int], int]:
         selected: list[int] = []
         noise_removed = 0
         for index in sorted(indexes):
-            if index < 0 or index >= len(lines):
+            if index < 0 or index >= len(records):
                 continue
-            line = lines[index]
-            normalized = self.normalize_log_line(line)
+            record = records[index]
+            normalized = record.normalized
             is_reload_noise = bool(RESOURCE_RELOAD_NOISE_RE.search(normalized))
-            keep_reload_context = is_reload_noise and self.has_strategy_c_failure_context(lines, index)
+            keep_reload_context = is_reload_noise and self.has_strategy_c_failure_context(
+                [], index, records=records
+            )
             if (
-                self.is_strategy_c_noise_line(line, normalized)
-                and self.strategy_c_line_score(line, normalized) <= 0
+                record.is_noise
+                and record.score <= 0
                 and not keep_reload_context
             ):
                 noise_removed += 1
@@ -505,13 +769,17 @@ class ExtractionDomain:
         return selected, noise_removed
 
     def collect_strategy_c_indexes(self, lines: list[str]) -> tuple[set[int], int, int]:
-        selected = set(range(0, min(len(lines), STRATEGY_C_HEAD_TAIL_LINES)))
-        selected.update(range(max(0, len(lines) - STRATEGY_C_HEAD_TAIL_LINES), len(lines)))
+        return self.collect_strategy_c_indexes_from_records(self.build_strategy_c_records(lines))
+
+    def collect_strategy_c_indexes_from_records(
+        self, records: list[StrategyCLineRecord]
+    ) -> tuple[set[int], int, int]:
+        selected = set(range(0, min(len(records), STRATEGY_C_HEAD_TAIL_LINES)))
+        selected.update(range(max(0, len(records) - STRATEGY_C_HEAD_TAIL_LINES), len(records)))
         key_hits = 0
         strong_key_hits = 0
-        for index, line in enumerate(lines):
-            normalized = self.normalize_log_line(line)
-            score = self.strategy_c_line_score(line, normalized)
+        for index, record in enumerate(records):
+            score = record.score
             if score <= 0:
                 continue
             key_hits += 1
@@ -523,9 +791,9 @@ class ExtractionDomain:
                 radius = 12
             else:
                 radius = 4
-            selected.update(self.expand_indexes(len(lines), index, radius))
-            if self.is_strategy_c_block_seed(line, normalized):
-                selected.update(self.collect_strategy_c_block_indexes(lines, index))
+            selected.update(self.expand_indexes(len(records), index, radius))
+            if self.is_strategy_c_block_seed(record.raw, record.normalized):
+                selected.update(self.collect_strategy_c_block_indexes_from_records(records, index))
         return selected, key_hits, strong_key_hits
 
     def should_fallback_strategy_c(
@@ -549,26 +817,432 @@ class ExtractionDomain:
             return True
         return False
 
-    def build_strategy_c_regex_text(self, text: str, run_id: str = "") -> str:
+    def should_compact_log_prefixes(self) -> bool:
+        return bool(self._cfg().get("strategy_c_compact_prefix", True))
+
+    def should_keep_strategy_c_timestamps(self) -> bool:
+        return bool(self._cfg().get("strategy_c_keep_timestamps", False))
+
+    def format_log_line_for_output(
+        self,
+        line: str,
+        parsed: ParsedLogLine | None = None,
+        compact_prefix: bool | None = None,
+    ) -> str:
+        if compact_prefix is None:
+            compact_prefix = self.should_compact_log_prefixes()
+        if not compact_prefix:
+            return line
+        parsed = parsed or self.parse_log_line(line)
+        if not parsed.severity:
+            return line
+
+        parts: list[str] = []
+        if self.should_keep_strategy_c_timestamps() and parsed.timestamp:
+            parts.append(parsed.timestamp)
+
+        thread = (parsed.thread or "").strip()
+        if thread and thread.lower() not in {"main", "render thread"}:
+            parts.append(thread)
+
+        level_part = parsed.severity
+        if parsed.logger:
+            level_part = f"{level_part} {parsed.logger}"
+        parts.append(level_part)
+        return f"[{'/'.join(parts)}]: {parsed.body}"
+
+    def normalize_line_for_body_fold(self, text: str) -> str:
+        folded = FOLD_UUID_RE.sub("<uuid>", text or "")
+        folded = FOLD_HEX_ID_RE.sub("<id>", folded)
+        folded = FOLD_ENTITY_ID_RE.sub(r"\1=<id>", folded)
+        folded = FOLD_COORD_TRIPLE_RE.sub("<coords>", folded)
+        folded = FOLD_NUMBER_RE.sub("<num>", folded)
+        return re.sub(r"\s+", " ", folded).strip().lower()
+
+    def normalize_line_for_tail_fold(self, record: StrategyCLineRecord) -> str:
+        without_timestamp = TIMESTAMP_LINE_RE.sub("", record.raw, count=1)
+        return without_timestamp.strip()
+
+    def fold_strategy_c_output_groups(
+        self,
+        records: list[StrategyCLineRecord],
+        indexes: Iterable[int],
+    ) -> list[OutputLineGroup]:
+        groups: list[OutputLineGroup] = []
+        tail_start = max(0, len(records) - STRATEGY_C_HEAD_TAIL_LINES)
+        prev_key: str | None = None
+        prev_mode = ""
+
+        for index in sorted(indexes):
+            if index < 0 or index >= len(records):
+                continue
+            record = records[index]
+            in_tail = index >= tail_start
+            if in_tail:
+                mode = "tail"
+                key = self.normalize_line_for_tail_fold(record)
+            elif record.score >= STRATEGY_C_STRONG_SCORE:
+                mode = "body_exact"
+                key = record.normalized
+            else:
+                mode = "body"
+                key = self.normalize_line_for_body_fold(record.normalized)
+
+            can_fold = False
+            if groups and mode == prev_mode and key == prev_key:
+                if mode == "tail":
+                    can_fold = index == groups[-1].end + 1
+                else:
+                    can_fold = True
+
+            if can_fold:
+                groups[-1].end = index
+                groups[-1].repeat_count += 1
+                groups[-1].repeat_label = "连续重复" if mode == "tail" else "重复"
+            else:
+                groups.append(
+                    OutputLineGroup(
+                        start=index,
+                        end=index,
+                        text=self.format_log_line_for_output(record.raw, record.parsed),
+                        repeat_label="连续重复" if mode == "tail" else "重复",
+                    )
+                )
+            prev_key = key
+            prev_mode = mode
+        return groups
+
+    def compose_line_groups_with_gaps(self, groups: list[OutputLineGroup]) -> str:
+        if not groups:
+            return ""
+        result: list[str] = []
+        prev_end = -2
+        for group in groups:
+            if group.start != prev_end + 1:
+                result.append("...[中间内容已省略]...")
+            text = group.text
+            if group.repeat_count > 1:
+                text = f"{text} ({group.repeat_label} {group.repeat_count} 次)"
+            result.append(text)
+            prev_end = group.end
+        return "\n".join(result).strip()
+
+    def compose_strategy_c_records_with_gaps(
+        self,
+        records: list[StrategyCLineRecord],
+        indexes: Iterable[int],
+    ) -> str:
+        return self.compose_line_groups_with_gaps(
+            self.fold_strategy_c_output_groups(records, indexes)
+        )
+
+    def join_strategy_c_parts(self, termination_note: str, body: str) -> str:
+        return "\n".join(part for part in (termination_note, body) if part)
+
+    def compose_strategy_c_budgeted_text(
+        self,
+        records: list[StrategyCLineRecord],
+        indexes: Iterable[int],
+        termination_note: str,
+        limit: int | None = None,
+        priority_indexes: Iterable[int] | None = None,
+    ) -> str:
+        selected = sorted(set(indexes))
+        body = self.compose_strategy_c_records_with_gaps(records, selected)
+        full = self.join_strategy_c_parts(termination_note, body)
+        if not limit or len(full) <= limit:
+            return full
+
+        priority_selected = sorted(
+            index
+            for index in set(priority_indexes or [])
+            if 0 <= index < len(records)
+        )
+        tail_start = max(0, len(records) - STRATEGY_C_HEAD_TAIL_LINES)
+        head_indexes = [index for index in selected if index < STRATEGY_C_HEAD_TAIL_LINES]
+        tail_indexes = [index for index in selected if index >= tail_start]
+        strong_middle_indexes = [
+            index
+            for index in selected
+            if STRATEGY_C_HEAD_TAIL_LINES <= index < tail_start
+            and records[index].score >= STRATEGY_C_STRONG_SCORE
+        ]
+
+        protected_indexes = sorted(
+            set(head_indexes + strong_middle_indexes + tail_indexes + priority_selected)
+        )
+        protected = self.join_strategy_c_parts(
+            termination_note,
+            self.compose_strategy_c_records_with_gaps(records, protected_indexes),
+        )
+        if len(protected) <= limit:
+            return protected
+
+        if priority_selected:
+            priority_and_tail_indexes = sorted(set(priority_selected + tail_indexes))
+            priority_and_tail = self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, priority_and_tail_indexes),
+            )
+            if len(priority_and_tail) <= limit:
+                return priority_and_tail
+
+            priority_only = self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, priority_selected),
+            )
+            if len(priority_only) <= limit:
+                return priority_only
+
+            lo = 0
+            hi = len(priority_selected)
+            best_priority: list[int] = []
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate_indexes = priority_selected[:mid]
+                candidate = self.join_strategy_c_parts(
+                    termination_note,
+                    self.compose_strategy_c_records_with_gaps(records, candidate_indexes),
+                )
+                if len(candidate) <= limit:
+                    best_priority = candidate_indexes
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best_priority:
+                return self.join_strategy_c_parts(
+                    termination_note,
+                    self.compose_strategy_c_records_with_gaps(records, best_priority),
+                )
+
+        head_tail_indexes = sorted(set(head_indexes + tail_indexes))
+        head_tail = self.join_strategy_c_parts(
+            termination_note,
+            self.compose_strategy_c_records_with_gaps(records, head_tail_indexes),
+        )
+        if len(head_tail) <= limit:
+            return head_tail
+
+        tail_text = self.join_strategy_c_parts(
+            termination_note,
+            self.compose_strategy_c_records_with_gaps(records, tail_indexes),
+        )
+        if len(tail_text) <= limit:
+            lo = 0
+            hi = len(head_indexes)
+            best = tail_indexes
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate_indexes = sorted(set(head_indexes[:mid] + tail_indexes))
+                candidate = self.join_strategy_c_parts(
+                    termination_note,
+                    self.compose_strategy_c_records_with_gaps(records, candidate_indexes),
+                )
+                if len(candidate) <= limit:
+                    best = candidate_indexes
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, best),
+            )
+
+        lo = 0
+        hi = len(tail_indexes)
+        best_tail: list[int] = []
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate_indexes = tail_indexes[len(tail_indexes) - mid :]
+            candidate = self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, candidate_indexes),
+            )
+            if len(candidate) <= limit:
+                best_tail = candidate_indexes
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best_tail:
+            return self.join_strategy_c_parts(
+                termination_note,
+                self.compose_strategy_c_records_with_gaps(records, best_tail),
+            )
+        return termination_note[:limit]
+
+    def collect_error_focused_indexes(self, lines: list[str]) -> set[int]:
+        selected = set()
+        selected.update(range(0, min(len(lines), 180)))
+        selected.update(range(max(0, len(lines) - 180), len(lines)))
+        selected.update(self.collect_error_window_indexes(lines, window=8, max_hits=400))
+        ts_count = 0
+        for index, line in enumerate(lines):
+            if TIMESTAMP_LINE_RE.search(line):
+                selected.add(index)
+                ts_count += 1
+                if ts_count >= 240:
+                    break
+        return selected
+
+    def collect_must_keep_indexes_from_records(
+        self,
+        records: list[StrategyCLineRecord],
+        window: int,
+    ) -> set[int]:
+        if not records:
+            return set()
+        max_window = min(
+            DEFAULT_STRATEGY_C_MUST_KEEP_WINDOW_LINES,
+            max(1, int(window)),
+        )
+        lines = [record.raw for record in records]
+        normalized_lines = [record.normalized for record in records]
+
+        centers: list[int] = []
+        earliest_fatal = None
+        for record in records:
+            if record.parsed.severity in {"FATAL", "ERROR"}:
+                earliest_fatal = record.index
+                break
+        if earliest_fatal is not None:
+            centers.append(earliest_fatal)
+
+        cause_indexes = [
+            record.index for record in records if CAUSE_LINE_RE.search(record.normalized)
+        ]
+        if cause_indexes:
+            centers.append(max(cause_indexes))
+
+        version_indexes = [
+            record.index
+            for record in records
+            if VERSION_LINE_RE.search(record.raw) or VERSION_LINE_RE.search(record.normalized)
+        ]
+        centers.extend(version_indexes[:3])
+
+        crash_saved_indexes = [
+            record.index for record in records if CRASH_SAVED_RE.search(record.normalized)
+        ]
+        centers.extend(crash_saved_indexes[:1])
+
+        loader_anchor_patterns = (
+            DEPENDENCY_HEADER_RE,
+            MC_DIAGNOSTIC_LINE_RE,
+            CLASSLOAD_LINE_RE,
+            DATAPACK_FAILURE_RE,
+            SHADER_FAILURE_RE,
+            OOM_RE,
+            WATCHDOG_RE,
+            TICKING_KEEP_UP_RE,
+            ORDERED_STOP_RE,
+        )
+        for pattern in loader_anchor_patterns:
+            index = self.first_match_index(normalized_lines, pattern)
+            if index is not None:
+                centers.append(index)
+
+        selected: set[int] = set()
+        for center in centers:
+            selected.update(self.expand_indexes(len(lines), center, max_window))
+        selected.update(self.collect_priority_evidence_indexes_from_records(records, max_window))
+        return selected
+
+    def strategy_c_termination_note(self, records: list[StrategyCLineRecord]) -> str:
+        if not records:
+            return ""
+
+        category = ""
+        for record in reversed(records):
+            raw_or_body = f"{record.raw}\n{record.normalized}"
+            if OOM_RE.search(raw_or_body):
+                category = "OOM"
+            elif WATCHDOG_RE.search(raw_or_body):
+                category = "watchdog卡死"
+            elif TICKING_KEEP_UP_RE.search(raw_or_body):
+                category = "tick卡死"
+            elif ORDERED_STOP_RE.search(record.normalized):
+                category = "有序关闭"
+            if category:
+                break
+
+        last_record = None
+        for record in reversed(records):
+            if record.normalized and not record.is_noise:
+                last_record = record
+                break
+        if last_record is None:
+            return ""
+
+        last_logger = last_record.parsed.logger or last_record.parsed.thread or "unknown"
+        last_line = self.format_log_line_for_output(last_record.raw, last_record.parsed)
+        if not category:
+            category = "无声中断"
+            if self.has_actionable_failure_record(records):
+                hint = "；尾部无异常块，但前文已有异常/初始化失败证据，优先分析已保留的根因片段"
+            else:
+                hint = "；尾部无异常块/崩溃报告落点，真凶大概率在独立 hs_err_pid*.log 或启动器/系统日志"
+        else:
+            hint = ""
+        return f"[termination] type={category}; last_logger={last_logger}; last_non_noise={last_line}{hint}"
+
+    def build_strategy_c_regex_text(
+        self,
+        text: str,
+        run_id: str = "",
+        budget_limit: int | None = None,
+    ) -> str:
         lines = text.splitlines()
         if not lines:
             return ""
 
-        raw_key_hits, noise_candidates = self.collect_strategy_c_noise_stats(lines)
-        selected, key_hits, strong_key_hits = self.collect_strategy_c_indexes(lines)
-        pruned_selected, noise_removed = self.prune_strategy_c_noise_indexes(lines, selected)
-        reduced = self.compose_lines_with_gaps(lines, pruned_selected)
+        records = self.build_strategy_c_records(lines)
+        raw_key_hits, noise_candidates = self.collect_strategy_c_noise_stats_from_records(records)
+        selected, key_hits, strong_key_hits = self.collect_strategy_c_indexes_from_records(records)
+        must_keep_window = int(
+            self._cfg().get("must_keep_window_lines", DEFAULT_STRATEGY_C_MUST_KEEP_WINDOW_LINES)
+        )
+        must_keep_indexes = self.collect_must_keep_indexes_from_records(
+            records, must_keep_window
+        )
+        priority_indexes = self.collect_priority_evidence_indexes_from_records(
+            records, must_keep_window
+        )
+        selected_with_must_keep = set(selected) | must_keep_indexes
+        unified_selected, noise_removed = self.prune_strategy_c_noise_indexes_from_records(
+            records, selected_with_must_keep
+        )
+        termination_note = self.strategy_c_termination_note(records)
+        reduced = self.compose_strategy_c_budgeted_text(
+            records,
+            unified_selected,
+            termination_note,
+            budget_limit,
+            priority_indexes=priority_indexes,
+        )
         if self.should_fallback_strategy_c(reduced, key_hits, strong_key_hits, lines):
             logger.warning(
                 f"[mc_log][{run_id}] C策略正则去噪有效命中不足，回退到错误聚焦提取: "
                 f"raw_key_hits={raw_key_hits}, key_hits={key_hits}, strong_key_hits={strong_key_hits}, "
                 f"noise_candidates={noise_candidates}"
             )
-            return self.redact_strategy_c_output(self.build_error_focused_text(text))
+            fallback_selected, _ = self.prune_strategy_c_noise_indexes_from_records(
+                records,
+                set(self.collect_error_focused_indexes(lines)) | priority_indexes,
+            )
+            fallback = self.compose_strategy_c_budgeted_text(
+                records,
+                fallback_selected,
+                termination_note,
+                budget_limit,
+                priority_indexes=priority_indexes,
+            )
+            return self.redact_strategy_c_output(fallback)
 
         logger.info(
             f"[mc_log][{run_id}] C策略正则去噪完成: total_lines={len(lines)}, "
-            f"selected_lines={len(selected)}, pruned_selected_lines={len(pruned_selected)}, "
+            f"selected_lines={len(selected)}, must_keep_lines={len(must_keep_indexes)}, "
+            f"priority_lines={len(priority_indexes)}, "
+            f"unified_selected_lines={len(unified_selected)}, "
             f"raw_key_hits={raw_key_hits}, key_hits={key_hits}, strong_key_hits={strong_key_hits}, "
             f"noise_candidates={noise_candidates}, noise_removed={noise_removed}"
         )
@@ -588,7 +1262,12 @@ class ExtractionDomain:
             selected.update(range(lo, hi))
         return sorted(selected)
 
-    def compose_lines_with_gaps(self, lines: list[str], indexes: list[int]) -> str:
+    def compose_lines_with_gaps(
+        self,
+        lines: list[str],
+        indexes: list[int],
+        compact_prefix: bool | None = None,
+    ) -> str:
         if not indexes:
             return ""
         result = []
@@ -598,7 +1277,9 @@ class ExtractionDomain:
                 continue
             if idx != prev + 1:
                 result.append("...[中间内容已省略]...")
-            result.append(lines[idx])
+            result.append(
+                self.format_log_line_for_output(lines[idx], compact_prefix=compact_prefix)
+            )
             prev = idx
         return "\n".join(result).strip()
 
@@ -608,79 +1289,11 @@ class ExtractionDomain:
         lines = content.splitlines()
         if not lines:
             return []
-        max_window = max(1, int(window))
-
-        earliest_fatal = None
-        for index, line in enumerate(lines):
-            if re.search(r"\b(FATAL|ERROR)\b", line, re.IGNORECASE):
-                earliest_fatal = index
-                break
-
-        cause_indexes = [index for index, line in enumerate(lines) if CAUSE_LINE_RE.search(line)]
-        deepest_cause = max(cause_indexes) if cause_indexes else None
-        version_indexes = [
-            index
-            for index, line in enumerate(lines)
-            if VERSION_LINE_RE.search(line) or VERSION_LINE_RE.search(self.normalize_log_line(line))
-        ]
-        crash_saved_indexes = [index for index, line in enumerate(lines) if CRASH_SAVED_RE.search(line)]
-        loader_anchor_patterns = (
-            ("dependency", DEPENDENCY_HEADER_RE),
-            ("mod_loading", MC_DIAGNOSTIC_LINE_RE),
-            ("classload", CLASSLOAD_LINE_RE),
-            ("datapack", DATAPACK_FAILURE_RE),
-            ("shader", SHADER_FAILURE_RE),
-        )
-        loader_anchor_indexes: list[tuple[str, int]] = []
-        for label, pattern in loader_anchor_patterns:
-            index = self.first_match_index(
-                [self.normalize_log_line(line) for line in lines],
-                pattern,
-            )
-            if index is not None:
-                loader_anchor_indexes.append((label, index))
-
-        def window_block(center: int | None, label: str) -> str | None:
-            if center is None:
-                return None
-            lo = max(0, center - max_window)
-            hi = min(len(lines), center + max_window + 1)
-            block = lines[lo:hi]
-            if not block:
-                return None
-            return f"[must_keep:{label}]\n" + "\n".join(block)
-
-        blocks = []
-        for label, center in (("deepest_cause", deepest_cause), ("earliest_fatal", earliest_fatal)):
-            block = window_block(center, label)
-            if block:
-                blocks.append(block)
-
-        if version_indexes:
-            seen = set()
-            for index in version_indexes[:6]:
-                if index in seen:
-                    continue
-                seen.add(index)
-                block = window_block(index, "version_line")
-                if block:
-                    blocks.append(block)
-
-        if crash_saved_indexes:
-            for index in crash_saved_indexes[:2]:
-                block = window_block(index, "crash_saved")
-                if block:
-                    blocks.append(block)
-
-        seen_loader_labels = set()
-        for label, index in loader_anchor_indexes:
-            if label in seen_loader_labels:
-                continue
-            seen_loader_labels.add(label)
-            block = window_block(index, label)
-            if block:
-                blocks.append(block)
-        return blocks
+        records = self.build_strategy_c_records(lines)
+        indexes = sorted(self.collect_must_keep_indexes_from_records(records, window))
+        if not indexes:
+            return []
+        return ["[must_keep:deduped]\n" + self.compose_lines_with_gaps(lines, indexes)]
 
     def redact_strategy_c_output(self, text: str) -> str:
         if not text:
@@ -729,16 +1342,6 @@ class ExtractionDomain:
         lines = text.splitlines()
         if not lines:
             return ""
-        selected = set()
-        selected.update(range(0, min(len(lines), 180)))
-        selected.update(range(max(0, len(lines) - 180), len(lines)))
-        selected.update(self.collect_error_window_indexes(lines, window=8, max_hits=400))
-        ts_count = 0
-        for index, line in enumerate(lines):
-            if TIMESTAMP_LINE_RE.search(line):
-                selected.add(index)
-                ts_count += 1
-                if ts_count >= 240:
-                    break
+        selected = self.collect_error_focused_indexes(lines)
         merged = self.compose_lines_with_gaps(lines, sorted(selected))
         return merged or "\n".join(lines[:500])

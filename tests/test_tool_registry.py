@@ -14,6 +14,7 @@ install_astrbot_stubs()
 from mc_log.adapters.files import FileAdapter
 from mc_log.adapters.http_tools import HttpToolAdapter
 from mc_log.config import ConfigManager
+from mc_log.domain.extraction import ExtractionDomain
 from mc_log.domain.metrics import MetricsService
 from mc_log.domain.privacy import PrivacyService
 from mc_log.runtime import PluginRuntime
@@ -46,6 +47,7 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.config_manager = ConfigManager({"read_archive_file_limit": 1, "tool_snippet_chars": 5000})
         self.runtime = PluginRuntime()
         self.privacy = PrivacyService()
+        self.extraction_domain = ExtractionDomain(self.config_manager.get)
         self.file_adapter = FileAdapter(self.config_manager, self.runtime)
         self.http_adapter = HttpToolAdapter(self.config_manager, self.privacy)
         self.context = FakeContext()
@@ -56,6 +58,7 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.file_adapter,
             self.http_adapter,
             self.privacy,
+            self.extraction_domain,
         )
         self.event = FakeEvent(message_id="tool-mid")
 
@@ -281,6 +284,41 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("75服务端启动异常", result)
         self.assertIn("缺少依赖", result)
         self.assertNotIn("二进制文件", result)
+
+    async def test_read_archive_file_wrong_name_does_not_consume_limit(self):
+        path = self.case_root / "latest.log"
+        path.write_text("[00:10:02] [main/ERROR]: java.lang.RuntimeException: Boot failed", encoding="utf-8")
+        self.runtime.set_active_archive_file_map(self.event, {"logs/latest.log": path})
+
+        missing = await self.registry.tool_read_archive_file(self.event, "missing.log")
+        result = await self.registry.tool_read_archive_file(self.event, "logs/latest.log")
+
+        self.assertIn("未找到 `missing.log`", missing)
+        self.assertIn("Boot failed", result)
+        self.assertNotIn("调用次数已达上限", result)
+
+    async def test_read_archive_file_uses_normal_extraction_strategy(self):
+        path = self.case_root / "latest.log"
+        lines = ["[00:10:02] [main/INFO]: Minecraft Version: 1.20.1"]
+        lines.extend(f"[00:10:{index % 60:02d}] [main/INFO]: bootstrap line {index}" for index in range(1, 220))
+        lines.append("[00:13:40] [main/INFO]: CHAT_NOISE_SHOULD_DROP")
+        lines.extend(f"[00:14:{index % 60:02d}] [main/INFO]: middle line {index}" for index in range(221, 390))
+        lines.extend(
+            [
+                "[00:20:00] [main/ERROR]: java.lang.RuntimeException: Boot failed",
+                "Caused by: java.lang.ClassNotFoundException: com.example.MissingClass",
+                "at com.example.Loader.load(Loader.java:42)",
+            ]
+        )
+        path.write_text("\n".join(lines), encoding="utf-8")
+        self.runtime.set_active_archive_file_map(self.event, {"logs/latest.log": path})
+
+        result = await self.registry.tool_read_archive_file(self.event, "logs/latest.log", max_chars=35000)
+
+        self.assertIn("提取策略：C", result)
+        self.assertIn("Boot failed", result)
+        self.assertIn("ClassNotFoundException", result)
+        self.assertNotIn("CHAT_NOISE_SHOULD_DROP", result)
 
     async def test_search_tool_docs_updated(self):
         analyze_system = Path("assets/analyze_system.txt").read_text(encoding="utf-8")

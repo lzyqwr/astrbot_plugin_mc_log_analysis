@@ -30,6 +30,11 @@ class MessageTexts:
     text_render_fallback_notice: str = ""
     forward_sender_name: str = ""
     summary_template: str = ""
+    feedback_placeholder: str = ""
+    report_no_run: str = ""
+    report_packaged: str = ""
+    report_packaged_failed: str = ""
+    report_disabled: str = ""
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any] | None) -> "MessageTexts":
@@ -50,6 +55,11 @@ class MessageTexts:
             text_render_fallback_notice=str(values.get("text_render_fallback_notice", "") or ""),
             forward_sender_name=str(values.get("forward_sender_name", "") or ""),
             summary_template=str(values.get("summary_template", "") or ""),
+            feedback_placeholder=str(values.get("feedback_placeholder", "") or ""),
+            report_no_run=str(values.get("report_no_run", "") or ""),
+            report_packaged=str(values.get("report_packaged", "") or ""),
+            report_packaged_failed=str(values.get("report_packaged_failed", "") or ""),
+            report_disabled=str(values.get("report_disabled", "") or ""),
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -69,6 +79,11 @@ class MessageTexts:
             "text_render_fallback_notice": self.text_render_fallback_notice,
             "forward_sender_name": self.forward_sender_name,
             "summary_template": self.summary_template,
+            "feedback_placeholder": self.feedback_placeholder,
+            "report_no_run": self.report_no_run,
+            "report_packaged": self.report_packaged,
+            "report_packaged_failed": self.report_packaged_failed,
+            "report_disabled": self.report_disabled,
         }
 
     def get(self, key: str, default: str = "") -> str:
@@ -139,3 +154,15 @@ class ArchiveSessionState:
     file_map: dict[str, Path] = field(default_factory=dict)
     tool_calls: int = 0
     primary_source_name: str = ""
+
+
+@dataclass
+class RunReport:
+    run_id: str
+    session_id: str
+    sender_id: str
+    timestamp: str
+    source_name: str
+    input_file_path: Path | None = None
+    debug_log_path: Path | None = None
+    analysis_md: str = ""

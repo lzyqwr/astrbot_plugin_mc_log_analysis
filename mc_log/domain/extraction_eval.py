@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +17,7 @@ class GoldExtractionCase:
     gold_support_regexes: list[str]
     culprit_ids: list[str]
     forbidden_noise_regexes: list[str]
+    gold_signature_regexes: list[str] = field(default_factory=list)
 
 
 def load_gold_cases(path: Path) -> list[GoldExtractionCase]:
@@ -65,11 +66,13 @@ def evaluate_extractor(
             "chars": len(output),
             "root_recall": regex_recall(case.gold_root_regexes, output),
             "support_recall": regex_recall(case.gold_support_regexes, output),
+            "signature_recall": regex_recall(case.gold_signature_regexes, output),
             "culprit_recall": culprit_recall(case.culprit_ids, output),
             "noise_leak": noise_leak(case.forbidden_noise_regexes, output),
         }
         row["success"] = (
             row["root_recall"] == 1.0
+            and row["signature_recall"] == 1.0
             and row["culprit_recall"] == 1.0
             and row["noise_leak"] <= 0.25
         )
@@ -80,6 +83,7 @@ def evaluate_extractor(
             "rows": [],
             "macro_root_recall": 0.0,
             "macro_support_recall": 0.0,
+            "macro_signature_recall": 0.0,
             "macro_culprit_recall": 0.0,
             "macro_noise_leak": 0.0,
             "case_success_rate": 0.0,
@@ -89,6 +93,7 @@ def evaluate_extractor(
         "rows": rows,
         "macro_root_recall": _mean(rows, "root_recall"),
         "macro_support_recall": _mean(rows, "support_recall"),
+        "macro_signature_recall": _mean(rows, "signature_recall"),
         "macro_culprit_recall": _mean(rows, "culprit_recall"),
         "macro_noise_leak": _mean(rows, "noise_leak"),
         "case_success_rate": sum(bool(row["success"]) for row in rows) / len(rows),
@@ -109,6 +114,7 @@ def summarize_group(rows: list[dict[str, object]]) -> dict[str, float]:
         "case_count": float(len(rows)),
         "macro_root_recall": _mean(rows, "root_recall"),
         "macro_support_recall": _mean(rows, "support_recall"),
+        "macro_signature_recall": _mean(rows, "signature_recall"),
         "macro_culprit_recall": _mean(rows, "culprit_recall"),
         "macro_noise_leak": _mean(rows, "noise_leak"),
         "case_success_rate": sum(bool(row["success"]) for row in rows) / len(rows),

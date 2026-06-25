@@ -23,6 +23,8 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
+node4 = "请开发者喝杯奶茶:https://ifdian.net/a/lzyqwr"
+
 
 class RenderingAdapter:
     def __init__(self, config_manager, runtime, html_template_path: Path, html_render_func):
@@ -215,7 +217,18 @@ class RenderingAdapter:
         else:
             core_content = [Comp.Plain(render_payload)]
         node2 = Comp.Node(content=core_content, name=sender_name, uin=sender_uin)
-        return event.chain_result([Comp.Nodes(nodes=[node1, node2])])
+        nodes = [node1, node2]
+        placeholder = self._msg("feedback_placeholder")
+        if (
+            placeholder
+            and self._cfg().get("report_enabled", True)
+        ):
+            node3 = Comp.Node(
+                content=[Comp.Plain(placeholder)], name=sender_name, uin=sender_uin
+            )
+            nodes.append(node3)
+            nodes.append(node4)
+        return event.chain_result([Comp.Nodes(nodes=nodes)])
 
     def build_code_blocks_message(self, markdown_text: str) -> str:
         blocks = self.extract_fenced_code_blocks(markdown_text)

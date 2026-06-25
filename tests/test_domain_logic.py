@@ -332,14 +332,10 @@ class DomainLogicTests(unittest.TestCase):
         result = asyncio.run(
             extraction.strategy_c_extract(Path("latest.log"), fake_reader)
         )
-        expected = extraction.apply_budget_with_must_keep(
-            extraction.build_error_focused_text(content),
-            content,
-            config_manager.get()["total_char_limit"],
-        )
 
-        self.assertEqual(result, expected)
         self.assertTrue(result.strip())
+        self.assertIn("type=无声中断", result)
+        self.assertIn("heartbeat", result)
 
     def test_strategy_c_regex_filter_falls_back_when_only_weak_hits(self):
         extraction = ExtractionDomain(ConfigManager({}).get)
@@ -353,7 +349,9 @@ class DomainLogicTests(unittest.TestCase):
 
         reduced = extraction.build_strategy_c_regex_text(content)
 
-        self.assertEqual(reduced, extraction.build_error_focused_text(content))
+        self.assertIn("type=无声中断", reduced)
+        self.assertIn("Minecraft Version: 1.20.1", reduced)
+        self.assertIn("Fabric Loader 0.15.11", reduced)
 
     def test_strategy_c_regex_filter_preserves_mod_loading_diagnostics(self):
         extraction = ExtractionDomain(ConfigManager({}).get)
@@ -505,6 +503,258 @@ class DomainLogicTests(unittest.TestCase):
         self.assertIn("Server startup failed", reduced)
         self.assertIn("Missing registry", reduced)
 
+    def test_strategy_c_body_repeat_folding_uses_selected_sequence(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        lines = [
+            f"[10:00:{idx % 60:02d}] [main/INFO]: bootstrap {idx}"
+            for idx in range(20)
+        ]
+        lines.extend(
+            [
+                "[10:01:00] [Server thread/WARN]: Entity Zombie id=123 moved wrongly at 1, 64, -2",
+                "[10:01:01] [Server thread/INFO]: Loaded sound event minecraft:block.note_block.bell",
+                "[10:01:02] [Server thread/WARN]: Entity Zombie id=456 moved wrongly at 9, 70, -8",
+                "[10:01:03] [Server thread/WARN]: Entity Skeleton id=2 moved wrongly at 1, 64, -2",
+                "[10:01:04] [Server thread/WARN]: Entity Zombie id=789 moved wrongly at 3, 65, -4",
+            ]
+        )
+        lines.extend(
+            f"[10:02:{idx % 60:02d}] [main/INFO]: cooldown {idx}"
+            for idx in range(210)
+        )
+
+        reduced = extraction.build_strategy_c_regex_text("\n".join(lines))
+
+        self.assertIn("Entity Zombie id=123", reduced)
+        self.assertIn("(重复 2 次)", reduced)
+        self.assertNotIn("Loaded sound event", reduced)
+        self.assertIn("Entity Skeleton id=2", reduced)
+        self.assertIn("Entity Zombie id=789", reduced)
+
+    def test_strategy_c_tail_repeat_folding_is_strict_and_preserves_values(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        lines = [
+            f"[11:00:{idx % 60:02d}] [main/INFO]: bootstrap {idx}"
+            for idx in range(70)
+        ]
+        lines.extend(
+            [
+                "[11:01:00] [Server thread/ERROR]: java.lang.RuntimeException: tick loop failed",
+                "[11:01:01] [Server thread/WARN]: tick took 60000ms",
+                "[11:01:02] [Server thread/WARN]: at mod.example.Tick.run(Tick.java:1)",
+                "[11:01:03] [Server thread/WARN]: tick took 60000ms",
+                "[11:01:04] [Server thread/WARN]: at mod.example.Tick.run(Tick.java:1)",
+                "[11:01:05] [Server thread/WARN]: repeated exact tail line",
+                "[11:01:06] [Server thread/WARN]: repeated exact tail line",
+            ]
+        )
+        lines.extend(
+            f"[11:02:{idx % 60:02d}] [main/INFO]: cooldown {idx}"
+            for idx in range(120)
+        )
+
+        reduced = extraction.build_strategy_c_regex_text("\n".join(lines))
+
+        self.assertEqual(reduced.count("tick took 60000ms"), 2)
+        self.assertIn("(连续重复 2 次)", reduced)
+
+    def test_strategy_c_tail_repeat_folding_ignores_timestamp_only(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        lines = [
+            f"[11:10:{idx % 60:02d}] [main/INFO]: bootstrap {idx}"
+            for idx in range(40)
+        ]
+        lines.extend(
+            [
+                "[11:11:00] [Server thread/WARN]: Can't keep up! Ticking entity took 5000ms",
+                "[11:11:01] [Server thread/WARN]: Can't keep up! Ticking entity took 5000ms",
+                "[11:11:02] [Server thread/WARN]: Can't keep up! Ticking entity took 60000ms",
+            ]
+        )
+        lines.extend(
+            f"[11:12:{idx % 60:02d}] [main/INFO]: cooldown {idx}"
+            for idx in range(160)
+        )
+
+        reduced = extraction.build_strategy_c_regex_text("\n".join(lines))
+
+        self.assertIn("Ticking entity took 5000ms", reduced)
+        self.assertIn("(连续重复 2 次)", reduced)
+        self.assertIn("Ticking entity took 60000ms", reduced)
+
+    def test_strategy_c_prefix_compression_can_keep_timestamps(self):
+        compact = ExtractionDomain(ConfigManager({}).get)
+        verbose = ExtractionDomain(
+            ConfigManager({"strategy_c_compact_prefix": False}).get
+        )
+        timed = ExtractionDomain(
+            ConfigManager({"strategy_c_keep_timestamps": True}).get
+        )
+        line = "[12:00:01] [main/ERROR]: java.lang.RuntimeException: boom"
+
+        self.assertEqual(
+            compact.format_log_line_for_output(line),
+            "[ERROR]: java.lang.RuntimeException: boom",
+        )
+        self.assertEqual(verbose.format_log_line_for_output(line), line)
+        self.assertEqual(
+            timed.format_log_line_for_output(line),
+            "[12:00:01/ERROR]: java.lang.RuntimeException: boom",
+        )
+
+    def test_strategy_c_prefix_compression_preserves_forge_marker_logger(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        line = (
+            "[19Mar2025 21:24:12.115] [modloading-worker-0/WARN] "
+            "[net.minecraftforge.registries/REGISTRIES]: Missing registry id example:thing"
+        )
+
+        parsed = extraction.parse_log_line(line)
+        compacted = extraction.format_log_line_for_output(line, parsed)
+
+        self.assertEqual(parsed.logger, "net.minecraftforge.registries/REGISTRIES")
+        self.assertIn("net.minecraftforge.registries/REGISTRIES", compacted)
+        self.assertIn("Missing registry id example:thing", compacted)
+
+    def test_strategy_c_termination_notes_cover_oom_and_silent_tail(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        oom = "\n".join(
+            [
+                "[12:10:00] [main/INFO]: Minecraft Version: 1.20.1",
+                "java.lang.OutOfMemoryError: Java heap space",
+            ]
+        )
+        silent = "\n".join(
+            [
+                "[12:20:00] [main/INFO]: Minecraft Version: 1.20.1",
+                "[12:20:01] [main/INFO]: Preparing spawn area",
+            ]
+        )
+
+        self.assertIn("type=OOM", extraction.build_strategy_c_regex_text(oom))
+        silent_reduced = extraction.build_strategy_c_regex_text(silent)
+        self.assertIn("type=无声中断", silent_reduced)
+        self.assertIn("hs_err_pid*.log", silent_reduced)
+
+    def test_strategy_c_termination_uses_last_terminal_signal(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        content = "\n".join(
+            [
+                "[12:30:00] [Server thread/WARN]: Can't keep up! Ticking entity took 5000ms",
+                "[12:31:00] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space",
+            ]
+        )
+
+        self.assertIn("type=OOM", extraction.build_strategy_c_regex_text(content))
+
+    def test_strategy_c_budget_preserves_position_independent_evidence(self):
+        extraction = ExtractionDomain(
+            ConfigManager({"must_keep_window_lines": 2}).get
+        )
+        lines = [
+            f"[15:00:{idx % 60:02d}] [main/INFO]: bootstrap {idx}"
+            for idx in range(240)
+        ]
+        lines.extend(
+            [
+                (
+                    "[15:04:01] [Server thread/WARN]: WorldEdit "
+                    "Java8Detector failed while reading java.specification.version"
+                ),
+                (
+                    "[15:04:02] [Server thread/WARN]: "
+                    "java.lang.ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1"
+                ),
+                "[15:04:03] [Server thread/WARN]: at java.base/java.lang.StringLatin1.charAt(StringLatin1.java:48)",
+                (
+                    "[15:04:04] [Server thread/WARN]: Warning: Nashorn engine is "
+                    "planned to be removed from a future JDK release"
+                ),
+                (
+                    "[15:04:05] [Server thread/ERROR]: javax.script.ScriptException: "
+                    "<eval>:1:18 Expected ; but found calculateFinalDamage"
+                ),
+                (
+                    "[15:04:06] [Server thread/ERROR]: "
+                    "at jdk.nashorn.api.scripting.NashornScriptEngine.throwAsScriptException"
+                ),
+                "[15:04:07] [Server thread/ERROR]: java.lang.ExceptionInInitializerError",
+                (
+                    "[15:04:08] [Server thread/ERROR]: "
+                    "at pers.neige.neigeitems.manager.ItemManager.<clinit>(ItemManager.java:42)"
+                ),
+                (
+                    "[15:04:09] [Server thread/WARN]: Could not pass event "
+                    "EntityTransformEvent to MythicMobs v4.12.0"
+                ),
+                (
+                    "[15:04:10] [Server thread/WARN]: java.lang.NoClassDefFoundError: "
+                    "org/bukkit/event/entity/EntityTransformEvent"
+                ),
+            ]
+        )
+        lines.extend(
+            f"[15:05:{idx % 60:02d}] [main/INFO]: quiet tail {idx}"
+            for idx in range(280)
+        )
+
+        reduced = extraction.build_strategy_c_regex_text(
+            "\n".join(lines),
+            budget_limit=2600,
+        )
+
+        self.assertLessEqual(len(reduced), 2600)
+        self.assertIn("Java8Detector", reduced)
+        self.assertIn("java.base/java.lang.StringLatin1", reduced)
+        self.assertIn("Nashorn engine is planned to be removed", reduced)
+        self.assertIn("calculateFinalDamage", reduced)
+        self.assertIn("ExceptionInInitializerError", reduced)
+        self.assertIn("<clinit>", reduced)
+        self.assertIn("EntityTransformEvent", reduced)
+        self.assertIn("前文已有异常/初始化失败证据", reduced)
+        self.assertNotIn("真凶大概率", reduced)
+
+    def test_strategy_c_budget_keeps_tail_when_middle_is_too_large(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        lines = [
+            f"[13:00:{idx % 60:02d}] [main/INFO]: bootstrap long head line {idx}"
+            for idx in range(220)
+        ]
+        lines.extend(
+            f"[13:01:{idx % 60:02d}] [main/WARN]: middle warning spam {idx}"
+            for idx in range(220)
+        )
+        lines.extend(
+            [
+                "[13:02:00] [main/ERROR]: TAIL_CRASH_MARKER java.lang.RuntimeException: final failure",
+                "Caused by: java.lang.IllegalStateException: tail cause",
+            ]
+        )
+
+        reduced = extraction.build_strategy_c_regex_text(
+            "\n".join(lines),
+            budget_limit=1600,
+        )
+
+        self.assertLessEqual(len(reduced), 1600)
+        self.assertIn("TAIL_CRASH_MARKER", reduced)
+        self.assertIn("tail cause", reduced)
+
+    def test_strategy_c_fallback_still_adds_termination_and_folds_tail(self):
+        extraction = ExtractionDomain(ConfigManager({}).get)
+        content = "\n".join(
+            [
+                *(f"[14:00:{idx % 60:02d}] [main/INFO]: bootstrap {idx}" for idx in range(260)),
+                "[14:01:00] [Server thread/INFO]: repeated quiet tail",
+                "[14:01:01] [Server thread/INFO]: repeated quiet tail",
+            ]
+        )
+
+        reduced = extraction.build_strategy_c_regex_text(content)
+
+        self.assertIn("type=无声中断", reduced)
+        self.assertIn("(连续重复 2 次)", reduced)
+
     def test_strategy_c_content_sniffing_for_noncanonical_run_logs(self):
         extraction = ExtractionDomain(ConfigManager({}).get)
         content = "\n".join(
@@ -585,6 +835,7 @@ class DomainLogicTests(unittest.TestCase):
         self.assertIsInstance(cases[0], GoldExtractionCase)
         self.assertEqual(metrics["macro_root_recall"], 1.0)
         self.assertEqual(metrics["macro_support_recall"], 1.0)
+        self.assertEqual(metrics["macro_signature_recall"], 1.0)
         self.assertEqual(metrics["macro_culprit_recall"], 1.0)
         self.assertEqual(metrics["macro_noise_leak"], 0.0)
         self.assertEqual(metrics["case_success_rate"], 1.0)
