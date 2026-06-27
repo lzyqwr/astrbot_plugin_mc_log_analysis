@@ -118,7 +118,7 @@ class LogAnalyzer(Star):
         await self.result_cache.cleanup_expired()
         logger.info("[mc_log] 插件已初始化")
 
-    @filter.on_llm_request
+    @filter.on_llm_request()
     async def on_llm_request(self, event, req):
         """框架 LLM 请求前注入：若用户 10 分钟内调用过分析，提示 LLM 主动调用 get_cached_analysis。"""
         if self.result_cache is None:
