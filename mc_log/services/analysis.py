@@ -13,16 +13,38 @@ NETWORK_SEARCH_NOTICE = "请注意，以下部分信息来源于网络搜索，�
 
 
 class AnalysisService:
-    def __init__(self, context, config_manager, runtime, prompt_manager, tool_registry, metrics_service):
+    def __init__(self, context, config_manager, runtime, prompt_manager, tool_registry, metrics_service, token_stats=None):
         self.context = context
         self.config_manager = config_manager
         self.runtime = runtime
         self.prompt_manager = prompt_manager
         self.tool_registry = tool_registry
         self.metrics_service = metrics_service
+        self.token_stats = token_stats
 
     def _cfg(self):
         return self.config_manager.get()
+
+    async def _record_token_usage(self, llm_resp, event, source: str = "analysis"):
+        """从 LLMResponse.usage 提取 token 用量并记录。"""
+        if self.token_stats is None:
+            return
+        usage = getattr(llm_resp, "usage", None)
+        if usage is None:
+            return
+        try:
+            input_tokens = int(getattr(usage, "input", 0) or 0)
+            output_tokens = int(getattr(usage, "output", 0) or 0)
+        except Exception:
+            return
+        if input_tokens == 0 and output_tokens == 0:
+            return
+        uid = str(event.get_sender_id() or "")
+        session_id = str(getattr(event, "unified_msg_origin", "") or getattr(event, "session_id", "") or "")
+        try:
+            await self.token_stats.record(uid, session_id, input_tokens, output_tokens, source)
+        except Exception as exc:
+            logger.warning(f"[mc_log] 记录分析 token 用量失败: {exc}")
 
     def is_retryable_api_error(self, exc: Exception) -> bool:
         if isinstance(exc, aiohttp.ClientResponseError):
@@ -323,6 +345,7 @@ class AnalysisService:
                     ),
                     timeout=timeout_sec,
                 )
+                await self._record_token_usage(llm_resp, event, "analysis")
             except Exception as exc:
                 tool_failed = True
                 tool_failure_reason = str(exc)
@@ -350,6 +373,7 @@ class AnalysisService:
                     ),
                     timeout=timeout_sec,
                 )
+                await self._record_token_usage(llm_resp, event, "analysis_fallback")
             text, diag = self.extract_llm_text_with_diag(llm_resp)
             text = text.strip()
             if text:
@@ -381,6 +405,7 @@ class AnalysisService:
                             ),
                             timeout=timeout_sec,
                         )
+                        await self._record_token_usage(fallback_resp, event, "analysis_retry")
                         fb_text, _ = self.extract_llm_text_with_diag(fallback_resp)
                         fb_text = fb_text.strip()
                         if fb_text:

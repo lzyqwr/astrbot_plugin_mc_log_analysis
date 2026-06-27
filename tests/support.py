@@ -149,6 +149,7 @@ def install_astrbot_stubs():
         permission_type=noop_decorator,
         command=noop_decorator,
         on_llm_request=noop_decorator,
+        on_llm_response=noop_decorator,
     )
 
     event_mod.AstrMessageEvent = AstrMessageEvent

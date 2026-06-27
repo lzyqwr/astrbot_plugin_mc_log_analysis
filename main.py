@@ -16,7 +16,7 @@ if __package__:
     from .mc_log.domain import ExtractionDomain, MetricsService, PrivacyService
     from .mc_log.prompts import PromptManager
     from .mc_log.runtime import PluginRuntime
-    from .mc_log.services import AnalysisService, Coordinator, ReportStore, ResultCache, ToolRegistry
+    from .mc_log.services import AnalysisService, Coordinator, ReportStore, ResultCache, TokenStatsService, ToolRegistry
 else:
     plugin_root = Path(__file__).resolve().parent
     if str(plugin_root) not in sys.path:
@@ -27,7 +27,7 @@ else:
     from mc_log.domain import ExtractionDomain, MetricsService, PrivacyService
     from mc_log.prompts import PromptManager
     from mc_log.runtime import PluginRuntime
-    from mc_log.services import AnalysisService, Coordinator, ReportStore, ResultCache, ToolRegistry
+    from mc_log.services import AnalysisService, Coordinator, ReportStore, ResultCache, TokenStatsService, ToolRegistry
 
 
 @register(
@@ -60,6 +60,7 @@ class LogAnalyzer(Star):
             self.html_render,
         )
         self.result_cache = ResultCache(self.config_manager)
+        self.token_stats = TokenStatsService()
         self.tool_registry = ToolRegistry(
             self.context,
             self.config_manager,
@@ -77,6 +78,7 @@ class LogAnalyzer(Star):
             self.prompt_manager,
             self.tool_registry,
             self.metrics_service,
+            self.token_stats,
         )
         self.report_store = ReportStore(self.config_manager, self.runtime)
         self.coordinator = Coordinator(
@@ -139,6 +141,64 @@ class LogAnalyzer(Star):
         else:
             req.prompt = hint
         logger.info(f"[mc_log] 已为 uid={uid} 注入分析缓存提示")
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event, response):
+        """框架 LLM 响应后：记录 token 用量。"""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        try:
+            input_tokens = int(getattr(usage, "input", 0) or 0)
+            output_tokens = int(getattr(usage, "output", 0) or 0)
+        except Exception:
+            return
+        if input_tokens == 0 and output_tokens == 0:
+            return
+        uid = str(event.get_sender_id() or "")
+        session_id = str(getattr(event, "unified_msg_origin", "") or getattr(event, "session_id", "") or "")
+        try:
+            await self.token_stats.record(uid, session_id, input_tokens, output_tokens, "framework")
+        except Exception as exc:
+            logger.warning(f"[mc_log] 记录 token 用量失败: {exc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("token_stats")
+    async def show_token_stats(self, event: AstrMessageEvent):
+        stats = await self.token_stats.get_stats()
+        sender_name = "Token统计"
+        sender_uin = str(event.get_self_id() or "0")
+        nodes = []
+
+        summary_lines = ["===== Token 用量统计 ====="]
+        for label, key in [
+            ("总使用量", "total"),
+            ("本月使用量", "month"),
+            ("昨日使用量", "yesterday"),
+            ("近6小时使用量", "six_hour"),
+        ]:
+            d = stats[key]
+            summary_lines.append(f"{label}: 输入 {d['input']} / 输出 {d['output']} / 合计 {d['sum']}")
+        summary_lines.append(f"\n记录总数: {stats['record_count']}")
+        nodes.append(Comp.Node(content=[Comp.Plain("\n".join(summary_lines))], name=sender_name, uin=sender_uin))
+
+        per_user = stats["per_user"]
+        if per_user:
+            user_lines = ["--- 各用户使用量 ---"]
+            for uid, d in list(per_user.items())[:20]:
+                user_lines.append(f"  {uid}: 输入 {d['input']} / 输出 {d['output']} / 合计 {d['sum']}")
+            nodes.append(Comp.Node(content=[Comp.Plain("\n".join(user_lines))], name=sender_name, uin=sender_uin))
+
+        per_session = stats["per_session"]
+        if per_session:
+            session_lines = ["--- 各会话使用量 ---"]
+            for sid, d in list(per_session.items())[:20]:
+                session_lines.append(f"  {sid}: 输入 {d['input']} / 输出 {d['output']} / 合计 {d['sum']}")
+            nodes.append(Comp.Node(content=[Comp.Plain("\n".join(session_lines))], name=sender_name, uin=sender_uin))
+
+        result = event.chain_result([Comp.Nodes(nodes=nodes)])
+        result.stop_event()
+        yield result
 
     async def terminate(self):
         await self.runtime.stop_all_debug_captures()
