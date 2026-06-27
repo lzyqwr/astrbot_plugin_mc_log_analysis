@@ -58,6 +58,23 @@ class ResultCache:
                 self._store.pop(normalized, None)
             return list(entries)
 
+    async def has_recent(self, uid: str, within_seconds: float = 600.0) -> bool:
+        """是否存在在 within_seconds 秒内存储的缓存条目。"""
+        normalized = str(uid or "").strip()
+        if not normalized or within_seconds <= 0:
+            return False
+        now = time.monotonic()
+        async with self._lock:
+            entries = self._prune_uid(self._store.get(normalized, []), now)
+            if entries:
+                self._store[normalized] = entries
+            else:
+                self._store.pop(normalized, None)
+            for entry in entries:
+                if (now - float(entry.get("stored_at", 0.0))) <= within_seconds:
+                    return True
+        return False
+
     async def cleanup_expired(self) -> None:
         now = time.monotonic()
         async with self._lock:

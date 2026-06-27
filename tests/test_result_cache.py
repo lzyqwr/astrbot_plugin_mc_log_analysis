@@ -7,6 +7,7 @@ from tests.support import FakeContext, FakeEvent, install_astrbot_stubs
 
 install_astrbot_stubs()
 
+from main import LogAnalyzer
 from mc_log.config import ConfigManager
 from mc_log.domain.extraction import ExtractionDomain
 from mc_log.domain.privacy import PrivacyService
@@ -86,6 +87,78 @@ class ResultCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await cache.get_all("111")), 1)
         self.assertEqual(len(await cache.get_all("222")), 1)
         self.assertEqual((await cache.get_all("111"))[0]["text"], "用户一结果")
+
+    async def test_has_recent_true_within_window(self):
+        cache = ResultCache(ConfigManager({}))
+        await cache.store("123456", "结果A")
+        self.assertTrue(await cache.has_recent("123456", 600.0))
+
+    async def test_has_recent_false_outside_window(self):
+        cache = ResultCache(ConfigManager({}))
+        with patch("mc_log.services.result_cache.time.monotonic") as mock_time:
+            mock_time.return_value = 1000.0
+            await cache.store("123456", "旧结果")
+            mock_time.return_value = 1000.0 + 601.0
+            recent = await cache.has_recent("123456", 600.0)
+        self.assertFalse(recent)
+
+    async def test_has_recent_false_for_unknown_uid(self):
+        cache = ResultCache(ConfigManager({}))
+        self.assertFalse(await cache.has_recent("999", 600.0))
+
+    async def test_has_recent_false_for_empty_uid(self):
+        cache = ResultCache(ConfigManager({}))
+        self.assertFalse(await cache.has_recent("", 600.0))
+
+
+class FakeReq:
+    def __init__(self, prompt=None):
+        self.prompt = prompt
+
+
+class OnLlmRequestHookTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.plugin = LogAnalyzer(FakeContext(), {})
+
+    async def test_injects_hint_when_recent_analysis_exists(self):
+        event = FakeEvent(sender_id="123456")
+        req = FakeReq(prompt="帮我看看刚才的日志")
+        await self.plugin.result_cache.store("123456", "分析结果")
+        await self.plugin.on_llm_request(event, req)
+        self.assertIn("get_cached_analysis", req.prompt)
+        self.assertIn("过去10分钟内", req.prompt)
+        self.assertIn("帮我看看刚才的日志", req.prompt)
+
+    async def test_no_injection_when_no_recent_analysis(self):
+        event = FakeEvent(sender_id="123456")
+        req = FakeReq(prompt="你好")
+        await self.plugin.on_llm_request(event, req)
+        self.assertEqual(req.prompt, "你好")
+
+    async def test_no_injection_for_unknown_uid(self):
+        event = FakeEvent(sender_id="999999")
+        await self.plugin.result_cache.store("123456", "别人的结果")
+        req = FakeReq(prompt="你好")
+        await self.plugin.on_llm_request(event, req)
+        self.assertEqual(req.prompt, "你好")
+
+    async def test_injects_when_prompt_is_none(self):
+        event = FakeEvent(sender_id="123456")
+        req = FakeReq(prompt=None)
+        await self.plugin.result_cache.store("123456", "分析结果")
+        await self.plugin.on_llm_request(event, req)
+        self.assertIsNotNone(req.prompt)
+        self.assertIn("get_cached_analysis", req.prompt)
+
+    async def test_no_injection_after_window_expires(self):
+        event = FakeEvent(sender_id="123456")
+        req = FakeReq(prompt="你好")
+        with patch("mc_log.services.result_cache.time.monotonic") as mock_time:
+            mock_time.return_value = 1000.0
+            await self.plugin.result_cache.store("123456", "分析结果")
+            mock_time.return_value = 1000.0 + 601.0
+            await self.plugin.on_llm_request(event, req)
+        self.assertEqual(req.prompt, "你好")
 
 
 class GetCachedAnalysisToolTests(unittest.IsolatedAsyncioTestCase):

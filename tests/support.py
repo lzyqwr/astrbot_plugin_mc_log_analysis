@@ -97,6 +97,9 @@ def install_astrbot_stubs():
         ADMIN = "admin"
 
     def noop_decorator(*args, **kwargs):
+        if len(args) == 1 and not kwargs and callable(args[0]):
+            return args[0]
+
         def _wrap(obj):
             return obj
 
@@ -145,6 +148,7 @@ def install_astrbot_stubs():
         PermissionType=PermissionType,
         permission_type=noop_decorator,
         command=noop_decorator,
+        on_llm_request=noop_decorator,
     )
 
     event_mod.AstrMessageEvent = AstrMessageEvent

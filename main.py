@@ -118,6 +118,28 @@ class LogAnalyzer(Star):
         await self.result_cache.cleanup_expired()
         logger.info("[mc_log] 插件已初始化")
 
+    @filter.on_llm_request
+    async def on_llm_request(self, event, req):
+        """框架 LLM 请求前注入：若用户 10 分钟内调用过分析，提示 LLM 主动调用 get_cached_analysis。"""
+        if self.result_cache is None:
+            return
+        uid = str(event.get_sender_id() or "").strip()
+        if not uid:
+            return
+        try:
+            recent = await self.result_cache.has_recent(uid, 600.0)
+        except Exception as exc:
+            logger.warning(f"[mc_log] 检查最近分析缓存失败: {exc}")
+            return
+        if not recent:
+            return
+        hint = "[系统状态] 该用户在过去10分钟内调用过崩溃日志分析。若对话涉及该结果,请主动调用 get_cached_analysis 获取,不要凭空作答。"
+        if getattr(req, "prompt", None):
+            req.prompt = f"{req.prompt}\n\n{hint}"
+        else:
+            req.prompt = hint
+        logger.info(f"[mc_log] 已为 uid={uid} 注入分析缓存提示")
+
     async def terminate(self):
         await self.runtime.stop_all_debug_captures()
         self.runtime.uninstall_record_factory()
