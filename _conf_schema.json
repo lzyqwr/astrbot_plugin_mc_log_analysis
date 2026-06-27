@@ -342,5 +342,17 @@
     "condition": {
       "report_enabled": true
     }
+  },
+  "result_cache_ttl_sec": {
+    "description": "结果缓存 / 缓存有效期",
+    "type": "int",
+    "default": 1800,
+    "hint": "单位为秒，默认 1800（30 分钟）。分析结果文本按触发者 uid 缓存，供框架 LLM 通过 get_cached_analysis 工具查询。"
+  },
+  "result_cache_max_per_uid": {
+    "description": "结果缓存 / 每 uid 最多保留条数",
+    "type": "int",
+    "default": 10,
+    "hint": "每个 uid 在缓存有效期内最多保留的分析结果条数，超出后按时间倒序截断。"
   }
 }

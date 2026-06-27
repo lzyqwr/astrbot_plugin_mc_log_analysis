@@ -33,6 +33,7 @@ class ToolRegistry:
         http_adapter,
         privacy_service,
         extraction_domain=None,
+        result_cache=None,
     ):
         self.context = context
         self.config_manager = config_manager
@@ -41,6 +42,7 @@ class ToolRegistry:
         self.http_adapter = http_adapter
         self.privacy_service = privacy_service
         self.extraction_domain = extraction_domain or ExtractionDomain(config_manager.get)
+        self.result_cache = result_cache
         self.mod_fix_status_service = ModFixStatusService(
             context,
             config_manager,
@@ -124,9 +126,33 @@ class ToolRegistry:
             },
             handler=self.tool_check_mod_fix_status,
         )
-        self.context.add_llm_tools(search_sites_tool, read_archive_file_tool, check_mod_fix_status_tool)
+        tools_to_register = [search_sites_tool, read_archive_file_tool, check_mod_fix_status_tool]
+        if self.result_cache is not None:
+            get_cached_analysis_tool = FunctionTool(
+                name="get_cached_analysis",
+                description=(
+                    "获取指定用户(uid)在最近 30 分钟内由本插件产出的所有 Minecraft 日志分析结果文本。"
+                    "uid 为纯数字的 QQ 号。当用户询问自己之前的日志分析结果时调用。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "uid": {
+                            "type": "string",
+                            "description": "触发日志分析的用户 uid，纯数字的 QQ 号。",
+                        }
+                    },
+                    "required": ["uid"],
+                },
+                handler=self.tool_get_cached_analysis,
+            )
+            tools_to_register.append(get_cached_analysis_tool)
+        self.context.add_llm_tools(*tools_to_register)
         self._tool_registered = True
-        logger.info("[mc_log] 工具已注册: search_mc_sites, read_archive_file, check_mod_fix_status")
+        logger.info(
+            "[mc_log] 工具已注册: search_mc_sites, read_archive_file, check_mod_fix_status"
+            + (", get_cached_analysis" if self.result_cache is not None else "")
+        )
 
     def build_toolset(self, names: list[str]) -> ToolSet | None:
         manager = self.context.get_llm_tool_manager()
@@ -180,6 +206,22 @@ class ToolRegistry:
                 "warnings": [f"tool failed: {exc}"],
             }
         return self.privacy_service.guard_for_llm(json.dumps(payload, ensure_ascii=False))
+
+    async def tool_get_cached_analysis(self, event, uid: str) -> str:
+        normalized = str(uid or "").strip()
+        logger.info(f"[mc_log][tool] get_cached_analysis 请求: uid={normalized}")
+        if not normalized:
+            return "uid 无效，请提供纯数字的 QQ 号。"
+        if self.result_cache is None:
+            return "分析结果缓存未启用。"
+        entries = await self.result_cache.get_all(normalized)
+        if not entries:
+            return f"uid={normalized} 在缓存有效期内暂无日志分析结果。"
+        lines = [f"uid={normalized} 共有 {len(entries)} 条缓存的日志分析结果："]
+        for idx, entry in enumerate(entries, start=1):
+            lines.append(f"--- 结果 {idx} ---")
+            lines.append(str(entry.get("text") or ""))
+        return self.privacy_service.guard_for_llm("\n".join(lines))
 
     async def search_github_issues(self, query: str) -> dict:
         search_query = f"{query} is:issue"

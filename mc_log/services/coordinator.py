@@ -38,6 +38,7 @@ class Coordinator:
         analysis_service,
         tool_registry,
         report_store=None,
+        result_cache=None,
     ):
         self.context = context
         self.config_manager = config_manager
@@ -51,6 +52,7 @@ class Coordinator:
         self.analysis_service = analysis_service
         self.tool_registry = tool_registry
         self.report_store = report_store
+        self.result_cache = result_cache
         self._metrics_lock = asyncio.Lock()
 
     def _cfg(self):
@@ -465,6 +467,11 @@ class Coordinator:
                                         report_md=report_md,
                                         started=started,
                                     )
+                                    if self.result_cache is not None:
+                                        await self.result_cache.store(
+                                            str(event.get_sender_id() or ""),
+                                            report_md,
+                                        )
                                     elapsed = time.monotonic() - started
                                     logger.info(
                                         f"[mc_log][{run_id}] 分析完成，总耗时: {elapsed:.2f}s"

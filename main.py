@@ -16,7 +16,7 @@ if __package__:
     from .mc_log.domain import ExtractionDomain, MetricsService, PrivacyService
     from .mc_log.prompts import PromptManager
     from .mc_log.runtime import PluginRuntime
-    from .mc_log.services import AnalysisService, Coordinator, ReportStore, ToolRegistry
+    from .mc_log.services import AnalysisService, Coordinator, ReportStore, ResultCache, ToolRegistry
 else:
     plugin_root = Path(__file__).resolve().parent
     if str(plugin_root) not in sys.path:
@@ -27,7 +27,7 @@ else:
     from mc_log.domain import ExtractionDomain, MetricsService, PrivacyService
     from mc_log.prompts import PromptManager
     from mc_log.runtime import PluginRuntime
-    from mc_log.services import AnalysisService, Coordinator, ReportStore, ToolRegistry
+    from mc_log.services import AnalysisService, Coordinator, ReportStore, ResultCache, ToolRegistry
 
 
 @register(
@@ -59,6 +59,7 @@ class LogAnalyzer(Star):
             self.html_template_path,
             self.html_render,
         )
+        self.result_cache = ResultCache(self.config_manager)
         self.tool_registry = ToolRegistry(
             self.context,
             self.config_manager,
@@ -67,6 +68,7 @@ class LogAnalyzer(Star):
             self.http_adapter,
             self.privacy_service,
             self.extraction_domain,
+            self.result_cache,
         )
         self.analysis_service = AnalysisService(
             self.context,
@@ -90,6 +92,7 @@ class LogAnalyzer(Star):
             self.analysis_service,
             self.tool_registry,
             self.report_store,
+            self.result_cache,
         )
         self._sync_aliases()
 
@@ -112,6 +115,7 @@ class LogAnalyzer(Star):
         self.runtime.install_record_factory()
         self.runtime.cleanup_stale_temp_dirs(hours=24, remover=self.file_adapter.safe_remove_dir_blocking)
         self.report_store.cleanup_stale_pending(hours=24)
+        await self.result_cache.cleanup_expired()
         logger.info("[mc_log] 插件已初始化")
 
     async def terminate(self):

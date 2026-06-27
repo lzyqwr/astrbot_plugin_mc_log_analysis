@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
     "file_download_timeout_sec": 30,
     "report_enabled": True,
     "report_history_size": 3,
+    "result_cache_ttl_sec": 1800,
+    "result_cache_max_per_uid": 10,
     "messages": {
         "accepted_notice": "已接收文件，正在分析，请稍候。",
         "download_failed": "日志文件下载失败，请稍后重试。",
@@ -179,6 +181,8 @@ def load_plugin_config(raw_config: Any) -> PluginConfig:
     cfg["file_download_timeout_sec"] = max(5, int(cfg["file_download_timeout_sec"]))
     cfg["report_enabled"] = bool(cfg.get("report_enabled", True))
     cfg["report_history_size"] = max(1, int(cfg.get("report_history_size", 3)))
+    cfg["result_cache_ttl_sec"] = max(60, int(cfg.get("result_cache_ttl_sec", 1800)))
+    cfg["result_cache_max_per_uid"] = max(1, int(cfg.get("result_cache_max_per_uid", 10)))
     raw_render_mode = str(cfg["render_mode"]).lower().strip()
     if raw_render_mode in {"html", "html_to_image"}:
         cfg["render_mode"] = "html_to_image"
