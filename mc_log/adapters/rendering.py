@@ -62,6 +62,7 @@ class RenderingAdapter:
             "omit_background": True,
             "full_page": True,
             "viewport_width": image_width,
+            "viewport_height": image_width,
             "animations": "disabled",
             "caret": "hide",
             "scale": "css",

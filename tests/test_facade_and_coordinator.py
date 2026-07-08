@@ -109,6 +109,8 @@ class FacadeAndCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         image_path.write_bytes(b"png")
 
         async def fake_html_render(template, values, options=None):
+            self.assertEqual(options["viewport_width"], 640)
+            self.assertEqual(options["viewport_height"], 640)
             return "https://example.com/rendered.png"
 
         async def fake_download_rendered_image(url):
