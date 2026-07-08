@@ -191,6 +191,11 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local runtime/test artifacts
+data/
+deep-research-report.md
+tests/_tmp_data/
+
 # PyPI configuration file
 .pypirc
 
